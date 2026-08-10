@@ -30,6 +30,7 @@ Known gaps in this path, stated plainly:
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -229,6 +230,192 @@ class FactorScore:
         if self.percentile >= 20:
             return "low"
         return "very low"
+
+
+# --------------------------------------------------------------------------- glossary
+@dataclass(frozen=True)
+class FactorExplanation:
+    """Plain-language help for one factor.
+
+    Every scorecard number should be readable by someone who does not already know the
+    jargon. ``measures`` says what the raw number is, ``high_means``/``low_means`` say what
+    the percentile implies, and ``read_value`` turns the raw number into a sentence with
+    units attached ("moved about 2.1x the market", not "2.1286").
+
+    All wording stays DESCRIPTIVE. A high momentum percentile means the stock has risen more
+    than its peers -- not that it is a good buy.
+    """
+
+    measures: str
+    high_means: str
+    low_means: str
+    read_value: Callable[[float], str] | None = None
+
+
+FAMILY_EXPLANATIONS: dict[str, str] = {
+    "momentum": (
+        "How strongly the stock has trended UP relative to peers over months. Momentum is a "
+        "long-documented anomaly: past winners have historically tended to keep winning over "
+        "3-12 month horizons. It says nothing about whether a company is cheap or sound."
+    ),
+    "reversal": (
+        "The opposite effect at SHORT horizons. Over days-to-weeks, sharp losers have "
+        "historically tended to bounce, so a HIGH reversal score means the stock has recently "
+        "fallen relative to peers. High momentum and high reversal together mean a long-term "
+        "winner that has pulled back recently."
+    ),
+    "defensive": (
+        "How calm the stock is. Combines volatility, market sensitivity (beta), and drawdown. "
+        "A HIGH score means it moves less than peers. The low-volatility anomaly is the "
+        "observation that calmer stocks have historically delivered better risk-adjusted "
+        "returns than their raw returns suggest -- not that they return more."
+    ),
+    "liquidity": (
+        "How easily the stock can be traded without moving its own price. Matters because a "
+        "signal you cannot trade cheaply is not a signal: transaction costs consume the edge. "
+        "A HIGH score means large orders are absorbed easily."
+    ),
+}
+
+COMPOSITE_EXPLANATION = (
+    "The average of the factor families above, each equally weighted. It summarizes what "
+    "KIND of stock this is right now -- trending or reverting, calm or volatile, liquid or "
+    "thin. It is NOT a prediction, NOT a rating, and NOT a buy/sell signal. Two stocks with "
+    "the same composite can behave completely differently."
+)
+
+
+def _pct(v: float) -> str:
+    return f"{v * 100:.1f}%"
+
+
+FACTOR_GLOSSARY: dict[str, FactorExplanation] = {
+    "momentum_252d": FactorExplanation(
+        "Total price change over the past 12 months (as a log return).",
+        "has risen much more than peers over the past year",
+        "has risen less, or fallen, versus peers over the past year",
+        lambda v: f"about {_pct(np.expm1(v))} price change over 12 months",
+    ),
+    "momentum_126d": FactorExplanation(
+        "Total price change over the past 6 months.",
+        "has gained strongly over 6 months versus peers",
+        "has performed weakly over 6 months versus peers",
+        lambda v: f"about {_pct(np.expm1(v))} price change over 6 months",
+    ),
+    "momentum_12m_ex1m": FactorExplanation(
+        "12-month change EXCLUDING the most recent month. The academic standard: the last "
+        "month is dropped because short-term reversal contaminates it.",
+        "shows a strong longer-run trend, ignoring last month's noise",
+        "shows a weak longer-run trend",
+        lambda v: f"about {_pct(np.expm1(v))} over months 2-12",
+    ),
+    "dist_52w_high": FactorExplanation(
+        "How far below its own 52-week high the stock is trading.",
+        "is trading near its 1-year peak",
+        "is trading well below its 1-year peak",
+        lambda v: f"about {_pct(abs(np.expm1(v)))} below its 52-week high",
+    ),
+    "trend_r2_63d": FactorExplanation(
+        "How well a straight line fits the last 3 months of price (R-squared, 0 to 1). "
+        "Measures the SMOOTHNESS of the move, not its direction.",
+        "has moved in a steady, consistent line",
+        "has moved erratically -- any gain came in jumps rather than a steady trend",
+        lambda v: (
+            f"R2 = {v:.2f} ("
+            + ("very smooth" if v > 0.7 else "moderately smooth" if v > 0.3 else "erratic, choppy")
+            + ")"
+        ),
+    ),
+    "reversal_5d": FactorExplanation(
+        "Last week's return, NEGATED, so recent losers score higher.",
+        "has fallen over the past week (the reversal effect favours recent losers)",
+        "has risen over the past week",
+        lambda v: f"about {_pct(np.expm1(-v))} over the past week",
+    ),
+    "reversal_21d": FactorExplanation(
+        "Last month's return, negated.",
+        "has fallen over the past month",
+        "has risen over the past month",
+        lambda v: f"about {_pct(np.expm1(-v))} over the past month",
+    ),
+    "volatility_252d": FactorExplanation(
+        "Annualized standard deviation of daily returns over 1 year -- how much the price "
+        "swings around.",
+        "is calmer than its peers",
+        "swings much more than its peers",
+        lambda v: f"{_pct(v)} annualized; a typical year moves roughly +/-{_pct(v)}",
+    ),
+    "beta_252d": FactorExplanation(
+        "Sensitivity to the S&P 500 (SPY). Beta 1.0 moves with the market; 2.0 moves twice "
+        "as much; negative moves opposite.",
+        "is less market-sensitive than its peers",
+        "amplifies market moves far more than its peers",
+        lambda v: (
+            f"moves about {abs(v):.2f}x the market"
+            + (", in the OPPOSITE direction" if v < 0 else "")
+            + f" -- a 1% market move implies roughly {v:+.2f}%"
+        ),
+    ),
+    "idio_vol_252d": FactorExplanation(
+        "Volatility of the part of the return the market does NOT explain -- company-specific "
+        "risk.",
+        "is driven mostly by the market, with little company-specific noise",
+        "has large company-specific swings independent of the market",
+        lambda v: f"{_pct(v)} annualized stock-specific volatility",
+    ),
+    "max_drawdown_252d": FactorExplanation(
+        "Worst peak-to-trough fall over the past year.",
+        "had a shallower worst-case fall than its peers",
+        "suffered a much deeper fall than its peers",
+        lambda v: f"fell {_pct(abs(v))} from its peak at the worst point",
+    ),
+    "downside_vol_60d": FactorExplanation(
+        "Volatility counting DOWN days only. Separates painful moves from pleasant ones.",
+        "has smaller downside swings than its peers",
+        "has larger downside swings than its peers",
+        lambda v: f"{_pct(v)} annualized downside volatility",
+    ),
+    "adv_21d": FactorExplanation(
+        "Average daily dollar volume over 21 sessions (log scale). How much money changes "
+        "hands each day.",
+        "is very heavily traded -- large orders are absorbed easily",
+        "is thinly traded -- large orders would move the price",
+        lambda v: f"roughly ${np.expm1(v) / 1e6:,.0f}M traded per day",
+    ),
+    "amihud_illiquidity_21d": FactorExplanation(
+        "Amihud illiquidity: how much the price moves per dollar traded. Low = liquid.",
+        "has a price that barely reacts to trading volume (very liquid)",
+        "has a price that moves sharply on modest volume (illiquid)",
+        lambda v: (
+            ("very liquid" if v < 0.005 else "liquid" if v < 0.05 else "less liquid")
+            + f" (raw {v:.4f})"
+        ),
+    ),
+    "spread_proxy_21d": FactorExplanation(
+        "Estimated bid-ask spread from the daily high-low range -- the cost of a round trip.",
+        "has tight spreads and is cheap to trade",
+        "has wide spreads, so each trade costs more",
+        lambda v: f"roughly {_pct(v)} of price as daily range",
+    ),
+}
+
+
+def explain_factor(name: str) -> FactorExplanation | None:
+    return FACTOR_GLOSSARY.get(name)
+
+
+def interpret_score(score: FactorScore) -> str:
+    """One-sentence reading of a specific factor score for a specific stock."""
+    explanation = FACTOR_GLOSSARY.get(score.name)
+    if explanation is None:
+        return ""
+    if score.percentile >= 60:
+        stance = explanation.high_means
+    elif score.percentile <= 40:
+        stance = explanation.low_means
+    else:
+        stance = "sits roughly in line with peers on this measure"
+    return f"This stock {stance}."
 
 
 @dataclass
@@ -605,8 +792,19 @@ def analyze_tickers(
     return cards, failures
 
 
-def format_scorecard(card: Scorecard) -> str:
-    """Render a scorecard as readable text."""
+def _wrap(text: str, width: int) -> list[str]:
+    """Wrap text for fixed-width terminal output."""
+    import textwrap
+
+    return textwrap.wrap(text, width=width) or [""]
+
+
+def format_scorecard(card: Scorecard, explain: bool = False) -> str:
+    """Render a scorecard as readable text.
+
+    ``explain=True`` adds a plain-language gloss to every value: what the metric measures,
+    the number restated with units, and what this stock's reading indicates.
+    """
     lines: list[str] = []
     lines.append("=" * 74)
     lines.append(f"  {card.ticker}  --  factor scorecard as of {card.as_of}")
@@ -619,26 +817,44 @@ def format_scorecard(card: Scorecard) -> str:
             f"  COMPOSITE STANDING: {card.composite_percentile:.0f}th percentile "
             f"(#{card.composite_rank} of {card.peer_count + 1})"
         )
-        lines.append(
-            "  Descriptive only -- this summarizes the factor characteristics the stock "
-            "exhibits\n  today. It is not a forecast and not a recommendation."
-        )
+        lines.append("")
+        for chunk in _wrap(COMPOSITE_EXPLANATION, 70):
+            lines.append(f"  {chunk}")
 
     for family, scores in card.factors.items():
         family_pct = card.family_percentiles.get(family, float("nan"))
         lines.append("")
         lines.append(f"  {family.upper()}  ({family_pct:.0f}th percentile overall)")
         lines.append("  " + "-" * 70)
+        if explain and family in FAMILY_EXPLANATIONS:
+            for chunk in _wrap(FAMILY_EXPLANATIONS[family], 68):
+                lines.append(f"    {chunk}")
+            lines.append("")
         for score in scores:
             bar_len = round(score.percentile / 5)
             bar = "#" * bar_len + "." * (20 - bar_len)
             lines.append(
                 f"    {score.description:<44s} {bar} {score.percentile:5.0f}%  ({score.label})"
             )
+            explanation = FACTOR_GLOSSARY.get(score.name)
+            plain = ""
+            if explanation and explanation.read_value:
+                try:
+                    plain = explanation.read_value(score.raw_value)
+                except Exception:
+                    plain = ""
+            if plain:
+                lines.append(f"      -> {plain}")
             lines.append(
                 f"      {'raw: ' + f'{score.raw_value:+.4f}':<20s} peer median: "
                 f"{score.peer_median:+.4f}"
             )
+            if explain and explanation:
+                for chunk in _wrap(f"MEASURES: {explanation.measures}", 64):
+                    lines.append(f"        {chunk}")
+                for chunk in _wrap(f"READING: {interpret_score(score)}", 64):
+                    lines.append(f"        {chunk}")
+                lines.append("")
 
     if card.unavailable_pillars:
         lines.append("")

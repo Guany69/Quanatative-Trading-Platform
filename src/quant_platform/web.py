@@ -23,9 +23,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from quant_platform.analysis import (
+    COMPOSITE_EXPLANATION,
     DEFAULT_PEER_UNIVERSE,
+    FAMILY_EXPLANATIONS,
     Scorecard,
     analyze_tickers,
+    explain_factor,
+    interpret_score,
 )
 from quant_platform.utilities.reproducibility import get_logger
 
@@ -77,6 +81,13 @@ button:hover { background: #1444b0; }
 .warn strong { display: block; margin-bottom: .35rem; }
 .warn ul { margin: .3rem 0 0; padding-left: 1.15rem; }
 .na { color: #888; font-size: .84rem; }
+.family-note { font-size: .8rem; color: #666; margin: 0 0 .6rem; line-height: 1.45; }
+.plain { font-size: .8rem; color: #1a56db; font-weight: 600; margin-top: .1rem; }
+.explain { margin: 0 0 .5rem; font-size: .8rem; }
+.explain summary { cursor: pointer; color: #777; font-size: .75rem; padding: .1rem 0; }
+.explain summary:hover { color: #1a56db; }
+.explain p { margin: .35rem 0; color: #555; line-height: 1.5;
+             border-left: 2px solid #e0e0e6; padding-left: .7rem; }
 table { width: 100%; border-collapse: collapse; font-size: .87rem; }
 th, td { padding: .45rem .5rem; text-align: right; border-bottom: 1px solid #eee; }
 th:first-child, td:first-child { text-align: left; font-weight: 600; }
@@ -94,6 +105,10 @@ footer { margin-top: 2.5rem; color: #777; font-size: .78rem; border-top: 1px sol
   .desc { color: #d5d5da; }
   th, td { border-color: #2c2d33; }
   .err { background: #3a1d1d; border-color: #6b2c2c; }
+  .family-note { color: #a0a0a8; }
+  .plain { color: #7aa2f7; }
+  .explain p { color: #b0b0b8; border-color: #3a3b42; }
+  .explain summary { color: #9a9aa2; }
 }
 """
 
@@ -176,8 +191,7 @@ def _render_card(card: Scorecard) -> str:
             f"{card.composite_percentile:.0f}<span style='font-size:.9rem'>th percentile</span>"
             f"</span> &middot; #{card.composite_rank} of {card.peer_count + 1}"
             f'<div style="font-size:.8rem;color:#666;margin-top:.3rem">'
-            f"Descriptive summary of the factor characteristics this stock shows today. "
-            f"Not a forecast.</div></div>"
+            f"{html.escape(COMPOSITE_EXPLANATION)}</div></div>"
         )
 
     for family, scores in card.factors.items():
@@ -185,17 +199,39 @@ def _render_card(card: Scorecard) -> str:
         parts.append(
             f'<div class="family">{html.escape(family)} &mdash; {family_pct:.0f}th percentile</div>'
         )
+        # What this family of factors actually captures, in plain language.
+        blurb = FAMILY_EXPLANATIONS.get(family)
+        if blurb:
+            parts.append(f'<div class="family-note">{html.escape(blurb)}</div>')
         for s in scores:
+            explanation = explain_factor(s.name)
+            plain = ""
+            if explanation and explanation.read_value:
+                try:
+                    plain = explanation.read_value(s.raw_value)
+                except Exception:  # a display helper must never break the page
+                    plain = ""
             parts.append(
                 f'<div class="row">'
                 f'<div><div class="desc">{html.escape(s.description)}</div>'
-                f'<div class="raw">raw {s.raw_value:+.4f} &middot; '
+                + (f'<div class="plain">{html.escape(plain)}</div>' if plain else "")
+                + f'<div class="raw">raw {s.raw_value:+.4f} &middot; '
                 f"peer median {s.peer_median:+.4f}</div></div>"
                 f'<div class="bar"><span style="width:{max(s.percentile, 1):.0f}%;'
                 f'background:{_bar_color(s.percentile)}"></span></div>'
                 f'<div class="pct">{s.percentile:.0f}%</div>'
                 f"</div>"
             )
+            if explanation:
+                reading = interpret_score(s)
+                parts.append(
+                    '<details class="explain"><summary>what does this mean?</summary>'
+                    f"<p><strong>Measures:</strong> {html.escape(explanation.measures)}</p>"
+                    f"<p><strong>Reading:</strong> {html.escape(reading)} "
+                    f"It sits at the {s.percentile:.0f}th percentile, meaning it scores higher "
+                    f"than {s.percentile:.0f}% of the peer group on this measure.</p>"
+                    "</details>"
+                )
 
     parts.append(_caveats(card))
     parts.append("</div>")

@@ -733,6 +733,9 @@ def analyze(
     ] = None,
     lookback_days: Annotated[int, typer.Option("--lookback-days")] = 600,
     out: Annotated[Path | None, typer.Option("--out", "-o", help="Write JSON here.")] = None,
+    explain: Annotated[
+        bool, typer.Option("--explain", help="Explain what every value means.")
+    ] = False,
 ) -> None:
     """Factor scorecard for real stocks, ranked against a peer universe.
 
@@ -790,7 +793,7 @@ def analyze(
         raise typer.Exit(1)
 
     for card in cards:
-        print(format_scorecard(card))
+        print(format_scorecard(card, explain=explain))
 
     if len(cards) > 1:
         _echo("COMPARISON (percentiles vs peers)", "ok")
