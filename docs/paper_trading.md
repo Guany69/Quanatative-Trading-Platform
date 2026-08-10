@@ -2,12 +2,13 @@
 
 ## Workflow
 
-```
-refresh -> validate -> features -> predict -> targets -> PROPOSE
-                                                          |
-                                                 [HUMAN APPROVAL]
-                                                          |
-                                            execute -> reconcile -> monitor
+```text
+designated completed run -> immutable snapshot -> shared validate/features path
+  -> stored fold artifact -> predict -> targets -> record PROPOSALS
+                                                   |
+                                         HUMAN APPROVE / REJECT
+                                                   |
+                         approved only -> delayed simulation -> reconcile -> persist
 ```
 
 Nothing crosses the approval boundary automatically. `SimulatedBroker.submit()` raises
@@ -18,6 +19,8 @@ in code because it is the boundary where software becomes money.
 
 ```bash
 uv run quant-platform paper-init                    # create the account
+uv run quant-platform paper-designate-model --run-id RUN_ID \
+  --model factor_composite --designated-by NAME
 uv run quant-platform paper-rebalance               # propose only (default)
 uv run quant-platform paper-rebalance --approve-all # approve + simulate fills
 uv run quant-platform paper-status                  # monitoring report
@@ -29,8 +32,10 @@ an all-or-nothing choice.
 ## State
 
 Persisted to `paper_state/state.json` via atomic write (temp file + rename), so an interrupted
-save cannot truncate the account history. Tracks cash, positions with average cost, every
-rebalance, pending proposals, equity history, realized P&L, and cumulative costs.
+save cannot truncate the account history. Tracks production designations, proposal history,
+approval/rejection identity and timestamps, fills, reconciliation, cash, positions, every
+rebalance, unfilled proposals, equity history, realized P&L, and cumulative costs. Reloading
+state validates the designation against the completed DuckDB run before new proposals.
 
 ## Reconciliation
 
@@ -44,6 +49,9 @@ persistent positive surprise means every backtest built on that model is optimis
 ## Safety
 
 - No broker integration exists. `NautilusBrokerAdapter` raises on instantiation.
+- No valid production designation means no proposal generation.
+- Real-data snapshots older than the staleness gate block proposal generation.
+- Same-session order/fill dates raise `ExecutionTimingError`.
 - Long-only; cash cannot go negative (regression-tested).
 - ADV participation limits cap fill sizes.
 - All fills are simulated: real execution differs in price, timing, and liquidity.

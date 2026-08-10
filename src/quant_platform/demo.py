@@ -525,11 +525,12 @@ def run_paper_rebalance(
     config_path: str | Path = "configs/research_charter.yaml",
     approve_all: bool = False,
     n_securities: int = 200,
+    results_db: str | Path = "research.duckdb",
 ) -> dict[str, Any]:
     """Generate paper-trading proposals and execute only approved orders."""
     from quant_platform.costs.model import CompositeCostModel
     from quant_platform.execution.base import SimulatedBroker, approve
-    from quant_platform.models.registry import create_model
+    from quant_platform.paper.coordinator import production_predictions
     from quant_platform.paper.rebalance import (
         execute_approved,
         propose_orders,
@@ -549,16 +550,8 @@ def run_paper_rebalance(
     else:
         state = PaperTradingState.initialize(charter.paper_trading.initial_capital)
 
-    data = load_fixture_data(charter, n_securities=n_securities)
-    panel = build_training_frame(data)
-    latest = as_date(panel["as_of"].max(), "latest signal date")
-    split_at = data.calendar.shift(latest, -60) or latest
-    train, recent = split_train_test(
-        panel, split_at, charter.validation.embargo_sessions, data.calendar
-    )
-    model = create_model("factor_composite", random_seed=charter.random_seed)
-    preds = fit_and_predict(
-        model, train, recent, data.feature_columns, "excess_return_rank", charter
+    reference, data, preds, model_metadata = production_predictions(
+        state, charter, results_db=results_db
     )
 
     signal_date = as_date(preds["as_of"].max(), "signal date")
@@ -567,12 +560,9 @@ def run_paper_rebalance(
         signal_date, charter.backtest.rebalance.execution_delay_sessions
     )
     if order_date is None:
-        # No future session in the fixture calendar: fall back to the signal date, and say so.
-        order_date = signal_date
-        logger.warning(
-            "no session available after %s in the fixture calendar; using the signal date as "
-            "the order date for this demonstration",
-            signal_date,
+        raise RuntimeError(
+            f"paper proposal generation blocked: no later trading session exists after "
+            f"signal date {signal_date}"
         )
 
     constructor = get_constructor("equal_weight", charter.portfolio)
@@ -605,6 +595,7 @@ def run_paper_rebalance(
         "proposals": [p.describe() for p in proposals],
         "n_filled": 0,
         "realized_cost": 0.0,
+        "production_model": f"{reference.run_id}:{reference.model}",
     }
 
     if not approve_all:
@@ -612,6 +603,8 @@ def run_paper_rebalance(
         return summary
 
     approve(proposals, approver="cli --approve-all")
+    state.record_decisions(proposals)
+    state.save(state_path)
     broker = SimulatedBroker(cost_model, cash=state.cash)
     fills, rejected = execute_approved(state, proposals, broker, prices)
     reconciliation = reconcile(state, targets, proposals, fills, prices, order_date)
@@ -624,8 +617,8 @@ def run_paper_rebalance(
         reconciliation,
         signal_date,
         order_date,
-        model_name=model.name,
-        model_version=model.version,
+        model_name=reference.model,
+        model_version=str(model_metadata.get("model_version", "unknown")),
         feature_version=charter.features.feature_version,
         approved_by="cli --approve-all",
     )

@@ -67,6 +67,7 @@ def validate_environment() -> None:
         "scipy",
         "matplotlib",
         "yaml",
+        "duckdb",
     ]
     optional = {
         "lightgbm": "primary nonlinear model",
@@ -74,7 +75,6 @@ def validate_environment() -> None:
         "optuna": "hyperparameter search",
         "cvxpy": "constrained optimizer",
         "yfinance": "open price data",
-        "duckdb": "analytical queries",
         "plotly": "interactive charts",
         "mlflow": "experiment tracking",
     }
@@ -112,6 +112,65 @@ def validate_environment() -> None:
         _echo(f"{failures} core dependency failure(s).", "err")
         raise typer.Exit(1)
     _echo("Environment OK: all core dependencies present.", "ok")
+
+
+def _csv_option(value: str, defaults: tuple[str, ...]) -> tuple[str, ...]:
+    if value.strip().lower() in {"all", "*"}:
+        return defaults
+    return tuple(item.strip().replace("-", "_") for item in value.split(",") if item.strip())
+
+
+def _cached_fixture_data(config: Path, securities: int):
+    """Resolve the legacy data-inspection commands through the consumed PIT cache."""
+    from dataclasses import asdict
+
+    from quant_platform.config import load_charter
+    from quant_platform.data.adapters.fixture import (
+        FIXTURE_SOURCE,
+        FixtureDataProvider,
+        FixtureSpec,
+    )
+    from quant_platform.data.snapshots import SnapshotStore
+    from quant_platform.research.panels import (
+        build_fold_panels,
+        derive_fold_schedule,
+        make_pit_cache_key,
+        pipeline_data_from_cache,
+    )
+    from quant_platform.research.pit_cache import PitPanelCache, fold_schedule_hash
+
+    charter = load_charter(config)
+    spec = FixtureSpec(n_securities=securities, seed=charter.random_seed)
+    provenance = {"provider": "FixtureDataProvider", "spec": asdict(spec)}
+    snapshots = SnapshotStore()
+    snapshot = snapshots.find_by_provenance(sources=[FIXTURE_SOURCE], provenance=provenance)
+    if snapshot is None:
+        dataset = FixtureDataProvider(spec).generate()
+        snapshot = snapshots.create(
+            {
+                name: getattr(dataset, name)
+                for name in (
+                    "securities",
+                    "identifiers",
+                    "prices",
+                    "benchmark",
+                    "membership",
+                    "corporate_actions",
+                    "fundamentals",
+                    "macro",
+                )
+            },
+            sources=[FIXTURE_SOURCE],
+            provenance=provenance,
+        )
+    folds, calendar = derive_fold_schedule(snapshot, charter)
+    schedule_hash = fold_schedule_hash(folds)
+    cache = PitPanelCache(Path(charter.data_sources.cache_dir) / "pit_cache")
+    cached = cache.get_or_build(
+        make_pit_cache_key(snapshot, charter, schedule_hash),
+        lambda: build_fold_panels(snapshot, charter, folds),
+    )
+    return charter, snapshot, cached, pipeline_data_from_cache(cached, charter, calendar)
 
 
 @app.command("inspect-reference-catalog")
@@ -154,7 +213,10 @@ def bootstrap_demo_data(
 ) -> None:
     """Generate the deterministic synthetic dataset and write it to Parquet."""
     configure_logging("INFO")
+    from dataclasses import asdict
+
     from quant_platform.data.adapters.fixture import FixtureDataProvider, FixtureSpec
+    from quant_platform.data.snapshots import SnapshotStore
 
     out.mkdir(parents=True, exist_ok=True)
     spec = FixtureSpec(n_securities=securities, seed=seed)
@@ -179,8 +241,26 @@ def bootstrap_demo_data(
         frame.write_parquet(path)
         print(f"  {name:18s} {frame.shape!s:>16s} -> {path}")
 
+    snapshot = SnapshotStore().create(
+        {
+            name: getattr(ds, name)
+            for name in (
+                "securities",
+                "identifiers",
+                "prices",
+                "benchmark",
+                "membership",
+                "corporate_actions",
+                "fundamentals",
+                "macro",
+            )
+        },
+        sources=["fixture_synthetic"],
+        provenance={"provider": "FixtureDataProvider", "spec": asdict(spec)},
+    )
+
     _echo("\nSYNTHETIC DATA: randomly generated. No investment meaning.", "warn")
-    _echo("Fixture written.", "ok")
+    _echo(f"Fixture written. immutable snapshot_id={snapshot.snapshot_id}", "ok")
 
 
 @app.command("run-demo")
@@ -216,39 +296,47 @@ def run_demo(
 @app.command("build-features")
 def build_features(
     config: ConfigOpt = Path("configs/research_charter.yaml"),
-    out: OutOpt = Path("data/processed"),
+    export: Annotated[
+        Path | None,
+        typer.Option("--export", "--out", help="Optional Parquet export path."),
+    ] = None,
     securities: Annotated[int, typer.Option("--securities", "-n")] = 120,
 ) -> None:
-    """Build the feature panel from the configured data source."""
+    """Build/load the feature panel through the governed PIT cache."""
     configure_logging("INFO")
-    from quant_platform.config import load_charter
-    from quant_platform.pipeline import load_fixture_data
-
-    charter = load_charter(config)
-    data = load_fixture_data(charter, n_securities=securities)
-    out.mkdir(parents=True, exist_ok=True)
-    path = out / "features.parquet"
-    data.features.write_parquet(path)
-    _echo(f"features {data.features.shape} -> {path}", "ok")
+    _charter, snapshot, cached, data = _cached_fixture_data(config, securities)
+    _echo(
+        f"features {data.features.shape} snapshot={snapshot.snapshot_id} "
+        f"cache={'HIT' if cached.cache_hit else 'MISS'}",
+        "ok",
+    )
+    if export:
+        export.parent.mkdir(parents=True, exist_ok=True)
+        data.features.write_parquet(export)
+        _echo(f"diagnostic export -> {export}", "info")
 
 
 @app.command("build-labels")
 def build_labels(
     config: ConfigOpt = Path("configs/research_charter.yaml"),
-    out: OutOpt = Path("data/processed"),
+    export: Annotated[
+        Path | None,
+        typer.Option("--export", "--out", help="Optional Parquet export path."),
+    ] = None,
     securities: Annotated[int, typer.Option("--securities", "-n")] = 120,
 ) -> None:
-    """Build forward benchmark-relative labels."""
+    """Build/load forward labels through the governed PIT cache."""
     configure_logging("INFO")
-    from quant_platform.config import load_charter
-    from quant_platform.pipeline import load_fixture_data
-
-    charter = load_charter(config)
-    data = load_fixture_data(charter, n_securities=securities)
-    out.mkdir(parents=True, exist_ok=True)
-    path = out / "labels.parquet"
-    data.labels.write_parquet(path)
-    _echo(f"labels {data.labels.shape} -> {path}", "ok")
+    charter, snapshot, cached, data = _cached_fixture_data(config, securities)
+    _echo(
+        f"labels {data.labels.shape} snapshot={snapshot.snapshot_id} "
+        f"cache={'HIT' if cached.cache_hit else 'MISS'}",
+        "ok",
+    )
+    if export:
+        export.parent.mkdir(parents=True, exist_ok=True)
+        data.labels.write_parquet(export)
+        _echo(f"diagnostic export -> {export}", "info")
     _echo(
         f"target={charter.label.target_type.value} "
         f"horizon={charter.label.forecast_horizon_sessions} sessions "
@@ -322,30 +410,133 @@ def validate_data(
 @app.command("build-universe")
 def build_universe(
     config: ConfigOpt = Path("configs/research_charter.yaml"),
-    out: OutOpt = Path("data/processed"),
+    export: Annotated[
+        Path | None,
+        typer.Option("--export", "--out", help="Optional Parquet export path."),
+    ] = None,
     securities: Annotated[int, typer.Option("--securities", "-n")] = 120,
 ) -> None:
-    """Build the point-in-time universe panel."""
+    """Build/load the point-in-time universe through the governed PIT cache."""
     configure_logging("INFO")
     import polars as pl
 
-    from quant_platform.config import load_charter
-    from quant_platform.pipeline import load_fixture_data
-
-    charter = load_charter(config)
-    data = load_fixture_data(charter, n_securities=securities)
-    out.mkdir(parents=True, exist_ok=True)
-    path = out / "universe.parquet"
-    data.universe_panel.write_parquet(path)
+    _charter, snapshot, cached, data = _cached_fixture_data(config, securities)
+    if export:
+        export.parent.mkdir(parents=True, exist_ok=True)
+        data.universe_panel.write_parquet(export)
 
     sizes = data.universe_panel.group_by("as_of").agg(pl.len().alias("n"))["n"]
-    _echo(f"universe {data.universe_panel.shape} -> {path}", "ok")
+    _echo(
+        f"universe {data.universe_panel.shape} snapshot={snapshot.snapshot_id} "
+        f"cache={'HIT' if cached.cache_hit else 'MISS'}",
+        "ok",
+    )
+    if export:
+        _echo(f"diagnostic export -> {export}", "info")
     _echo(
         f"eligible names per date: min={as_float(sizes.min(), context='min universe size'):.0f} "
         f"median={as_float(sizes.median(), context='median universe size'):.0f} "
         f"max={as_float(sizes.max(), context='max universe size'):.0f}",
         "info",
     )
+
+
+@app.command("research-run")
+def research_run(
+    config: ConfigOpt = Path("configs/research_charter.yaml"),
+    snapshot_id: Annotated[str, typer.Option("--snapshot-id")] = "auto",
+    models: Annotated[
+        str, typer.Option("--models", help="Comma-separated names or 'all'.")
+    ] = "all",
+    strategies: Annotated[
+        str, typer.Option("--strategies", help="Comma-separated names or 'all'.")
+    ] = "all",
+    scenarios: Annotated[str, typer.Option("--scenarios")] = "base",
+    portfolio_model: Annotated[str, typer.Option("--portfolio-model")] = "factor_composite",
+    securities: Annotated[int, typer.Option("--securities", "-n")] = 120,
+    workers: Annotated[int | None, typer.Option("--workers")] = None,
+    results_db: Annotated[Path, typer.Option("--results-db")] = Path("research.duckdb"),
+) -> None:
+    """Run the governed cached, parallel, persisted research and strategy comparison."""
+    configure_logging("INFO")
+    from quant_platform.research.runner import (
+        TARGET_MODELS,
+        TARGET_STRATEGIES,
+        ExperimentRunOrchestrator,
+        ResearchRunRequest,
+    )
+
+    request = ResearchRunRequest(
+        charter_path=config,
+        snapshot_id=snapshot_id,
+        models=_csv_option(models, TARGET_MODELS),
+        strategies=_csv_option(strategies, TARGET_STRATEGIES),
+        scenarios=_csv_option(scenarios, ("base", "double", "triple")),
+        portfolio_model=portfolio_model.replace("-", "_"),
+        fixture_securities=securities,
+        max_workers=workers,
+    )
+    try:
+        result = ExperimentRunOrchestrator(results_db=results_db).run(request)
+    except Exception as exc:
+        logger.exception("research run failed")
+        _echo(f"Research run failed: {exc}", "err")
+        raise typer.Exit(1) from exc
+    _echo(f"run_id={result.run_id} status={result.status}", "ok")
+    _echo(
+        f"snapshot={result.snapshot_id} cache={'HIT' if result.cache_hit else 'MISS'} "
+        f"total={result.timings.get('total_seconds', float('nan')):.2f}s",
+        "info",
+    )
+    print(result.model_comparison)
+    print(result.strategy_comparison)
+    if result.failed_variants:
+        _echo(f"{len(result.failed_variants)} strategy variant(s) failed loudly:", "warn")
+        for failure in result.failed_variants:
+            print(f"    {failure}")
+    for name, path in sorted(result.report_paths.items()):
+        print(f"    {name:16s} {path}")
+
+
+@app.command("results")
+def results_query(
+    table: Annotated[str, typer.Option("--table")] = "research_run",
+    run_id: Annotated[str | None, typer.Option("--run-id")] = None,
+    model: Annotated[str | None, typer.Option("--model")] = None,
+    strategy: Annotated[str | None, typer.Option("--strategy")] = None,
+    scenario: Annotated[str | None, typer.Option("--scenario")] = None,
+    sql: Annotated[
+        str | None, typer.Option("--sql", help="One read-only SELECT statement.")
+    ] = None,
+    export: Annotated[Path | None, typer.Option("--export")] = None,
+    limit: Annotated[int, typer.Option("--limit")] = 1000,
+    results_db: Annotated[Path, typer.Option("--results-db")] = Path("research.duckdb"),
+) -> None:
+    """Query authoritative persisted results across runs, models, folds and strategies."""
+    from quant_platform.research.results import ResultsReader, ResultsStoreError
+
+    try:
+        with ResultsReader(results_db) as reader:
+            frame = (
+                reader.query_sql(sql)
+                if sql
+                else reader.query(
+                    table,
+                    run_id=run_id,
+                    model=model.replace("-", "_") if model else None,
+                    strategy=strategy,
+                    cost_scenario=scenario,
+                    limit=limit,
+                )
+            )
+            if export:
+                reader.export_csv(frame, export)
+    except ResultsStoreError as exc:
+        _echo(str(exc), "err")
+        raise typer.Exit(1) from exc
+    print(frame)
+    if export:
+        _echo(f"exported {frame.height} row(s) -> {export}", "ok")
 
 
 @app.command("train")
@@ -358,52 +549,37 @@ def train(
     securities: Annotated[int, typer.Option("--securities", "-n")] = 200,
     test_start: Annotated[str, typer.Option("--test-start")] = "2021-01-04",
 ) -> None:
-    """Train one model and persist it with its metadata."""
+    """Run one model through governed folds and persist run-scoped artifacts."""
     configure_logging("INFO")
-    from quant_platform.config import load_charter
-    from quant_platform.models.registry import available_models, create_model
-    from quant_platform.pipeline import (
-        build_training_frame,
-        fit_and_predict,
-        forecast_ic,
-        load_fixture_data,
-        split_train_test,
-    )
-    from quant_platform.utilities.reproducibility import set_global_seeds
+    from quant_platform.research.runner import ExperimentRunOrchestrator, ResearchRunRequest
 
-    charter = load_charter(config)
-    set_global_seeds(charter.random_seed)
-
+    normalized = model.replace("-", "_")
     try:
-        instance = create_model(model, random_seed=charter.random_seed)
-    except KeyError as exc:
-        _echo(f"Unknown model '{model}'. Available: {', '.join(available_models())}", "err")
+        result = ExperimentRunOrchestrator(artifact_root=out).run(
+            ResearchRunRequest(
+                charter_path=config,
+                models=(normalized,),
+                strategies=("equal_weight",),
+                scenarios=("base",),
+                portfolio_model=normalized,
+                fixture_securities=securities,
+            )
+        )
+    except Exception as exc:
+        _echo(f"Governed training run failed: {exc}", "err")
         raise typer.Exit(1) from exc
-
-    data = load_fixture_data(charter, n_securities=securities)
-    panel = build_training_frame(data)
-    train_df, test_df = split_train_test(
-        panel, date.fromisoformat(test_start), charter.validation.embargo_sessions, data.calendar
-    )
-    preds = fit_and_predict(
-        instance, train_df, test_df, data.feature_columns, "excess_return_rank", charter
-    )
-    ic = forecast_ic(preds, test_df, "excess_return_rank")
-
-    out.mkdir(parents=True, exist_ok=True)
-    path = instance.save(out / f"{instance.name}.pkl")
-    _echo(f"trained {instance.name} on {train_df.height:,} rows -> {path}", "ok")
     _echo(
-        f"out-of-sample mean IC={ic.get('mean_ic', float('nan')):+.4f} "
-        f"IC_IR={ic.get('ic_ir', float('nan')):+.3f} over {int(ic.get('n_periods', 0))} periods",
-        "info",
+        f"run_id={result.run_id} model={normalized} status={result.status}; "
+        f"artifacts -> {out / result.run_id / normalized}",
+        "ok",
     )
-
-    importance = instance.feature_importance()
-    if importance is not None and not importance.is_empty():
-        _echo("\ntop features:", "info")
-        for row in importance.head(10).iter_rows(named=True):
-            print(f"    {row['feature']:28s} {row['importance']:.4f}")
+    if test_start != "2021-01-04":
+        _echo(
+            "--test-start is retained for CLI compatibility; governed fold dates come from "
+            "the validated charter.",
+            "warn",
+        )
+    print(result.model_comparison)
 
 
 @app.command("walk-forward")
@@ -413,70 +589,31 @@ def walk_forward(
     securities: Annotated[int, typer.Option("--securities", "-n")] = 200,
     out: OutOpt = Path("reports/walk_forward"),
 ) -> None:
-    """Run expanding-window walk-forward validation with purging and embargo."""
+    """Thin fold-diagnostics view over the governed research-run infrastructure."""
     configure_logging("INFO")
-    import polars as pl
+    from quant_platform.research.runner import ExperimentRunOrchestrator, ResearchRunRequest
 
-    from quant_platform.config import load_charter
-    from quant_platform.models.registry import create_model
-    from quant_platform.pipeline import (
-        build_training_frame,
-        fit_and_predict,
-        forecast_ic,
-        load_fixture_data,
-    )
-    from quant_platform.utilities.reproducibility import set_global_seeds
-    from quant_platform.validation.walk_forward import WalkForwardSplitter
-
-    charter = load_charter(config)
-    set_global_seeds(charter.random_seed)
-    data = load_fixture_data(charter, n_securities=securities)
-    panel = build_training_frame(data)
-
-    splitter = WalkForwardSplitter(charter.validation, data.calendar)
-    folds = splitter.generate_folds(
-        as_date(panel["as_of"].min(), "panel start"),
-        as_date(panel["as_of"].max(), "panel end"),
-    )
-    _echo(f"{len(folds)} folds", "info")
-
-    rows = []
-    for fold in folds:
-        train_df, _val, test_df = splitter.split(panel, fold)
-        if train_df.is_empty() or test_df.is_empty():
-            _echo(f"  {fold.describe()} -> SKIPPED (empty split)", "warn")
-            continue
-        instance = create_model(model, random_seed=charter.random_seed)
-        preds = fit_and_predict(
-            instance, train_df, test_df, data.feature_columns, "excess_return_rank", charter
+    normalized = model.replace("-", "_")
+    try:
+        result = ExperimentRunOrchestrator().run(
+            ResearchRunRequest(
+                charter_path=config,
+                models=(normalized,),
+                strategies=("equal_weight",),
+                scenarios=("base",),
+                portfolio_model=normalized,
+                fixture_securities=securities,
+            )
         )
-        ic = forecast_ic(preds, test_df, "excess_return_rank")
-        rows.append(
-            {
-                "fold": fold.index,
-                "train_end": fold.train_end,
-                "test_start": fold.test_start,
-                "test_end": fold.test_end,
-                "n_train": train_df.height,
-                "n_test": test_df.height,
-                "mean_ic": ic.get("mean_ic"),
-                "ic_ir": ic.get("ic_ir"),
-            }
-        )
-        _echo(
-            f"  {fold.describe()} -> IC={ic.get('mean_ic', float('nan')):+.4f}",
-            "info",
-        )
-
-    if not rows:
-        _echo("no folds produced results", "err")
-        raise typer.Exit(1)
-
-    frame = pl.DataFrame(rows)
+    except Exception as exc:
+        _echo(f"Walk-forward run failed: {exc}", "err")
+        raise typer.Exit(1) from exc
+    frame = result.model_comparison
     out.mkdir(parents=True, exist_ok=True)
-    frame.write_csv(out / "walk_forward.csv")
-    mean_ic = as_float(frame["mean_ic"].mean(), context="mean IC across folds")
-    _echo(f"\nmean IC across folds: {mean_ic:+.4f} -> {out / 'walk_forward.csv'}", "ok")
+    export = out / f"{result.run_id}_walk_forward.csv"
+    frame.write_csv(export)
+    print(frame)
+    _echo(f"governed run {result.run_id}; fold diagnostics -> {export}", "ok")
 
 
 @app.command("backtest")
@@ -568,6 +705,10 @@ def stress_test(
 @app.command("evaluate-holdout")
 def evaluate_holdout(
     config: ConfigOpt = Path("configs/research_charter.yaml"),
+    run_id: Annotated[str, typer.Option("--run-id")] = "",
+    model: Annotated[str, typer.Option("--model")] = "factor_composite",
+    acknowledged_by: Annotated[str, typer.Option("--acknowledged-by")] = "",
+    results_db: Annotated[Path, typer.Option("--results-db")] = Path("research.duckdb"),
     acknowledge: Annotated[
         bool,
         typer.Option(
@@ -578,28 +719,26 @@ def evaluate_holdout(
 ) -> None:
     """Evaluate the LOCKED HOLDOUT. Can only be done honestly once."""
     configure_logging("INFO")
-    from quant_platform.config import load_charter
+    from quant_platform.research.holdout import evaluate_locked_holdout
 
-    charter = load_charter(config)
-    if charter.validation.holdout is None:
-        _echo("No locked holdout is configured (validation.holdout is null).", "err")
+    if not run_id or not acknowledged_by:
+        _echo("--run-id and --acknowledged-by are required for a permanent holdout record", "err")
         raise typer.Exit(1)
-    if not (charter.validation.allow_holdout_evaluation and acknowledge):
-        _echo("Refusing to evaluate the locked holdout.", "err")
-        _echo(
-            "The holdout may not inform feature selection, hyperparameter tuning, model "
-            "selection, ensemble weighting, or cost calibration. Evaluating it more than "
-            "once invalidates the result.",
-            "warn",
+    try:
+        metrics = evaluate_locked_holdout(
+            run_id=run_id,
+            model=model.replace("-", "_"),
+            charter_path=config,
+            acknowledged_by=acknowledged_by,
+            acknowledge=acknowledge,
+            results_db=results_db,
         )
-        _echo(
-            "To proceed with a FINAL, already-chosen candidate: set "
-            "validation.allow_holdout_evaluation=true AND pass "
-            "--i-understand-this-can-only-be-done-once",
-            "warn",
-        )
-        raise typer.Exit(1)
-    _echo("Holdout evaluation acknowledged. This result is now consumed.", "warn")
+    except Exception as exc:
+        _echo(f"Holdout evaluation refused/failed: {exc}", "err")
+        raise typer.Exit(1) from exc
+    _echo("Holdout evaluation completed and permanently recorded.", "warn")
+    for key, value in metrics.items():
+        print(f"    {key:20s} {value}")
 
 
 @app.command("paper-init")
@@ -655,6 +794,32 @@ def paper_status(config: ConfigOpt = Path("configs/research_charter.yaml")) -> N
     _echo(f"\n{report['disclaimer']}", "warn")
 
 
+@app.command("paper-designate-model")
+def paper_designate_model(
+    run_id: Annotated[str, typer.Option("--run-id")],
+    model: Annotated[str, typer.Option("--model")],
+    designated_by: Annotated[str, typer.Option("--designated-by")],
+    config: ConfigOpt = Path("configs/research_charter.yaml"),
+    results_db: Annotated[Path, typer.Option("--results-db")] = Path("research.duckdb"),
+) -> None:
+    """Explicitly designate the auditable research model used by the paper account."""
+    from quant_platform.config import load_charter
+    from quant_platform.paper.state import PaperTradingState
+
+    charter = load_charter(config)
+    path = Path(charter.paper_trading.state_dir) / "state.json"
+    try:
+        state = PaperTradingState.load(path)
+        reference = state.designate_production_model(
+            run_id, model.replace("-", "_"), designated_by, results_db
+        )
+        state.save(path)
+    except Exception as exc:
+        _echo(f"Production-model designation failed: {exc}", "err")
+        raise typer.Exit(1) from exc
+    _echo(f"designated {reference.run_id}:{reference.model} -> {path}", "ok")
+
+
 @app.command("paper-rebalance")
 def paper_rebalance(
     config: ConfigOpt = Path("configs/research_charter.yaml"),
@@ -662,13 +827,19 @@ def paper_rebalance(
         bool, typer.Option("--approve-all", help="Approve every proposed order.")
     ] = False,
     securities: Annotated[int, typer.Option("--securities", "-n")] = 200,
+    results_db: Annotated[Path, typer.Option("--results-db")] = Path("research.duckdb"),
 ) -> None:
     """Generate paper-trading order proposals; execute only what is approved."""
     configure_logging("INFO")
     from quant_platform.demo import run_paper_rebalance
 
     try:
-        summary = run_paper_rebalance(config, approve_all=approve_all, n_securities=securities)
+        summary = run_paper_rebalance(
+            config,
+            approve_all=approve_all,
+            n_securities=securities,
+            results_db=results_db,
+        )
     except Exception as exc:
         logger.exception("paper rebalance failed")
         _echo(f"Paper rebalance failed: {exc}", "err")

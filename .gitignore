@@ -12,9 +12,17 @@ venv/
 .env
 .env.*
 .env.example
+.secrets/
+secrets/
 *.pem
 *.key
+*.p12
+*.pfx
+*.kdbx
+*.token
 credentials.json
+*_credentials.json
+service-account*.json
 
 # Local build and licence files (kept out of version control)
 LICENSE
@@ -24,6 +32,7 @@ Makefile
 data/raw/*
 data/interim/*
 data/processed/*
+data/snapshots/
 !data/**/.gitkeep
 *.parquet
 *.duckdb

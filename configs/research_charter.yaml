@@ -43,6 +43,10 @@ portfolio:
   cash_buffer: 0.0
   min_trade_size: 0.0
   restricted_securities: []
+  score_transform: linear
+  score_power: 1.0
+  score_temperature: 0.20
+  allow_constraint_relaxation: true
 
 acceptance_gates:
   min_holdout_net_information_ratio: 0.0

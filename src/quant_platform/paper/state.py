@@ -84,6 +84,14 @@ class RebalanceRecord:
         return self.realized_cost - self.expected_cost
 
 
+@dataclass(frozen=True)
+class ProductionModelReference:
+    run_id: str
+    model: str
+    designated_at: str
+    designated_by: str
+
+
 @dataclass
 class PaperTradingState:
     """The full persistent state of a paper-trading account."""
@@ -100,6 +108,12 @@ class PaperTradingState:
     benchmark_history: list[dict[str, Any]] = field(default_factory=list)
     realized_pnl: float = 0.0
     total_costs: float = 0.0
+    proposal_history: list[dict[str, Any]] = field(default_factory=list)
+    decision_history: list[dict[str, Any]] = field(default_factory=list)
+    fill_history: list[dict[str, Any]] = field(default_factory=list)
+    reconciliation_history: list[dict[str, Any]] = field(default_factory=list)
+    production_model: ProductionModelReference | None = None
+    production_model_history: list[dict[str, Any]] = field(default_factory=list)
 
     # ------------------------------------------------------------------ valuation
     def market_value(self, prices: dict[str, float] | None = None) -> float:
@@ -180,23 +194,123 @@ class PaperTradingState:
         Written to disk before any human sees them, so an approval decision always refers to
         an immutable, recorded set of orders.
         """
-        self.pending_proposals = [
-            {
-                "order_id": p.order_id,
-                "security_id": p.security_id,
-                "side": p.side.value,
-                "quantity": p.quantity,
-                "signal_date": str(p.signal_date),
-                "order_date": str(p.order_date),
-                "target_weight": p.target_weight,
-                "current_weight": p.current_weight,
-                "reference_price": p.reference_price,
-                "expected_cost": p.expected_cost.total,
-                "approved": p.approved,
-            }
-            for p in proposals
-        ]
+        self.pending_proposals = [self._proposal_payload(proposal) for proposal in proposals]
+        self.proposal_history.extend(dict(row) for row in self.pending_proposals)
         self.updated_at = datetime.now(UTC).isoformat()
+
+    @staticmethod
+    def _proposal_payload(proposal: OrderProposal) -> dict[str, Any]:
+        return {
+            "order_id": proposal.order_id,
+            "security_id": proposal.security_id,
+            "side": proposal.side.value,
+            "quantity": proposal.quantity,
+            "signal_date": str(proposal.signal_date),
+            "order_date": str(proposal.order_date),
+            "target_weight": proposal.target_weight,
+            "current_weight": proposal.current_weight,
+            "reference_price": proposal.reference_price,
+            "expected_cost": proposal.expected_cost.total,
+            "status": proposal.status.value,
+            "approved": proposal.approved,
+            "approved_at": proposal.approved_at.isoformat() if proposal.approved_at else None,
+            "approved_by": proposal.approved_by,
+            "rejection_reason": proposal.rejection_reason,
+            "rejected_at": proposal.rejected_at.isoformat() if proposal.rejected_at else None,
+            "rejected_by": proposal.rejected_by,
+        }
+
+    def record_decisions(self, proposals: list[OrderProposal]) -> None:
+        """Persist approval/rejection decisions when they happen, never reconstruct them."""
+        decided = [
+            self._proposal_payload(proposal)
+            for proposal in proposals
+            if proposal.approved or proposal.rejection_reason is not None
+        ]
+        existing = {
+            (row.get("order_id"), row.get("status"), row.get("approved_at"), row.get("rejected_at"))
+            for row in self.decision_history
+        }
+        self.decision_history.extend(
+            row
+            for row in decided
+            if (row["order_id"], row["status"], row["approved_at"], row["rejected_at"])
+            not in existing
+        )
+        by_id = {row["order_id"]: row for row in decided}
+        for collection in (self.pending_proposals, self.proposal_history):
+            for row in collection:
+                if row["order_id"] in by_id:
+                    row.update(by_id[row["order_id"]])
+        self.updated_at = datetime.now(UTC).isoformat()
+
+    def record_fills(self, fills: list[Fill]) -> None:
+        self.fill_history.extend(
+            {
+                "order_id": fill.order_id,
+                "security_id": fill.security_id,
+                "side": fill.side.value,
+                "quantity": fill.quantity,
+                "fill_price": fill.fill_price,
+                "fill_date": str(fill.fill_date),
+                "reference_price": fill.reference_price,
+                "costs": fill.costs.model_dump(mode="json"),
+                "is_partial": fill.is_partial,
+            }
+            for fill in fills
+        )
+
+    def record_reconciliation(self, report: Any) -> None:
+        payload = asdict(report) if hasattr(report, "__dataclass_fields__") else dict(report)
+        payload["cost_surprise_bps"] = getattr(report, "cost_surprise_bps", None)
+        self.reconciliation_history.append(payload)
+
+    def designate_production_model(
+        self,
+        run_id: str,
+        model: str,
+        designated_by: str,
+        results_db: str | Path = "research.duckdb",
+    ) -> ProductionModelReference:
+        """Record an explicit designation after validating its completed research result."""
+        from quant_platform.research.results import ResultsReader, ResultsStoreError
+
+        with ResultsReader(results_db) as reader:
+            run = reader.query("research_run", run_id=run_id, limit=1)
+            if run["status"][0] != "COMPLETED":
+                raise ResultsStoreError(f"run {run_id} is not completed")
+            reader.query("prediction", run_id=run_id, model=model, limit=1)
+        reference = ProductionModelReference(
+            run_id=run_id,
+            model=model,
+            designated_at=datetime.now(UTC).isoformat(),
+            designated_by=designated_by,
+        )
+        self.production_model = reference
+        self.production_model_history.append(asdict(reference))
+        self.updated_at = datetime.now(UTC).isoformat()
+        return reference
+
+    def require_production_model(
+        self, results_db: str | Path = "research.duckdb"
+    ) -> ProductionModelReference:
+        if self.production_model is None:
+            raise RuntimeError(
+                "paper proposal generation is blocked: no production model is designated"
+            )
+        from quant_platform.research.results import ResultsReader
+
+        with ResultsReader(results_db) as reader:
+            run = reader.query("research_run", run_id=self.production_model.run_id, limit=1)
+            if run["status"][0] != "COMPLETED":
+                raise RuntimeError("designated production run is no longer valid/completed")
+            reader.query(
+                "prediction",
+                run_id=self.production_model.run_id,
+                model=self.production_model.model,
+                limit=1,
+            )
+        return self.production_model
 
     def clear_proposals(self) -> None:
         self.pending_proposals = []
@@ -218,6 +332,12 @@ class PaperTradingState:
             "benchmark_history": self.benchmark_history,
             "realized_pnl": self.realized_pnl,
             "total_costs": self.total_costs,
+            "proposal_history": self.proposal_history,
+            "decision_history": self.decision_history,
+            "fill_history": self.fill_history,
+            "reconciliation_history": self.reconciliation_history,
+            "production_model": asdict(self.production_model) if self.production_model else None,
+            "production_model_history": self.production_model_history,
         }
         # Write via a temp file and rename: an interrupted save must not leave a truncated
         # state file, which would lose the account's history.
@@ -250,6 +370,13 @@ class PaperTradingState:
         state.pending_proposals = data.get("pending_proposals") or []
         state.equity_history = data.get("equity_history") or []
         state.benchmark_history = data.get("benchmark_history") or []
+        state.proposal_history = data.get("proposal_history") or []
+        state.decision_history = data.get("decision_history") or []
+        state.fill_history = data.get("fill_history") or []
+        state.reconciliation_history = data.get("reconciliation_history") or []
+        production = data.get("production_model")
+        state.production_model = ProductionModelReference(**production) if production else None
+        state.production_model_history = data.get("production_model_history") or []
         return state
 
     @classmethod
@@ -280,5 +407,10 @@ class PaperTradingState:
             "total_costs": self.total_costs,
             "n_rebalances": len(self.rebalances),
             "pending_approvals": len(self.pending_proposals),
+            "production_model": (
+                f"{self.production_model.run_id}:{self.production_model.model}"
+                if self.production_model
+                else None
+            ),
             "updated_at": self.updated_at,
         }

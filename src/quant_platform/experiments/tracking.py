@@ -37,6 +37,7 @@ class Trial:
     """One recorded experiment."""
 
     experiment_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    run_id: str | None = None
     created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     name: str = ""
     model_class: str = ""
@@ -111,6 +112,7 @@ class ExperimentRegistry:
         flat = [
             {
                 "experiment_id": r.get("experiment_id"),
+                "run_id": r.get("run_id"),
                 "created_at": r.get("created_at"),
                 "name": r.get("name"),
                 "model_class": r.get("model_class"),
@@ -135,6 +137,10 @@ class ExperimentRegistry:
         the Deflated Sharpe Ratio.
         """
         return len(self.load_all())
+
+    def run_ids(self) -> set[str]:
+        """Research runs linked into the append-only history."""
+        return {str(row["run_id"]) for row in self.load_all() if row.get("run_id")}
 
     def sharpe_ratios(self) -> list[float]:
         """Every recorded Sharpe ratio, for Deflated Sharpe's variance-across-trials term."""

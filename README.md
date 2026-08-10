@@ -51,19 +51,19 @@ uv run python scripts/fix_macos_libomp.py
 uv run quant-platform validate-environment
 ```
 
-## Quick start — the demo
+## Quick start — governed research
 
 Runs end to end with **no credentials and no network access**:
 
 ```bash
-uv run quant-platform run-demo
+uv run quant-platform research-run --models all --strategies all --workers 2
 ```
 
-This generates deterministic fixture data, validates it point-in-time, builds the universe,
-computes features and 20-session labels, splits with purging and embargo, trains models
-(including no-skill and momentum controls), builds three portfolio variants, applies costs,
-backtests with execution delay, runs cost stress scenarios, and writes a full report set to
-`reports/demo/`.
+This creates or resolves an immutable data snapshot, validates and content-caches PIT fold
+panels, trains all nine models in model/fold worker processes, compares four portfolio
+constructors on the same inputs, persists the complete run to `research.duckdb`, links the
+append-only experiment registry, and generates run-scoped reports. `run-demo` remains as a
+smaller legacy presentation workflow; it is not the research system of record.
 
 ## Commands
 
@@ -83,6 +83,9 @@ uv run quant-platform build-features
 uv run quant-platform build-labels
 
 # modeling
+uv run quant-platform research-run --models all --strategies all --workers 2
+uv run quant-platform results --table research_run
+uv run quant-platform results --run-id RUN_ID --table fold_metric --export metrics.csv
 uv run quant-platform train --model factor-composite
 uv run quant-platform train --model elastic-net
 uv run quant-platform train --model lightgbm
@@ -93,10 +96,13 @@ uv run quant-platform walk-forward --model lightgbm
 uv run quant-platform backtest --model lightgbm --portfolio equal_weight --cost double
 uv run quant-platform stress-test
 uv run quant-platform generate-report
-uv run quant-platform evaluate-holdout   # refuses without explicit acknowledgement
+uv run quant-platform evaluate-holdout --run-id RUN_ID --acknowledged-by NAME \
+  --i-understand-this-can-only-be-done-once
 
 # paper trading
 uv run quant-platform paper-init
+uv run quant-platform paper-designate-model --run-id RUN_ID --model factor_composite \
+  --designated-by NAME
 uv run quant-platform paper-rebalance                # proposes only
 uv run quant-platform paper-rebalance --approve-all  # approves + simulates fills
 uv run quant-platform paper-status
@@ -134,6 +140,18 @@ uv run pytest tests/data_leakage/      # the bias controls
 uv run pytest tests/portfolio_accounting/
 uv run pytest -m "not slow"
 ```
+
+## Benchmarking
+
+Run a fresh cold/warm benchmark with the complete roster:
+
+```bash
+uv run python scripts/benchmark_research.py --securities 120 --workers 2
+```
+
+The command writes its workload, run IDs, cache status, stage timings, and platform peak-RSS
+value beneath `artifacts/benchmarks/`. It measures the local synthetic fixture; it does not
+claim to reproduce another machine's reference timings.
 
 ## Code quality
 

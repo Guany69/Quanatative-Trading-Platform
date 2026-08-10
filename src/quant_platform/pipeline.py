@@ -19,9 +19,10 @@ from datetime import date
 import numpy as np
 import polars as pl
 
-from quant_platform.backtest.engine import BacktestEngine, BacktestResult
+from quant_platform.backtest.engine import BacktestEngine, BacktestResult, PreparedMarketData
 from quant_platform.config.models import ResearchCharter
 from quant_platform.data.adapters.fixture import FixtureDataProvider, FixtureSpec
+from quant_platform.data.snapshots import DataSnapshot
 from quant_platform.domain.enums import BenchmarkSource, CostScenario, EvaluationStage
 from quant_platform.domain.portfolio import PerformanceReport
 from quant_platform.evaluation.metrics import portfolio_metrics, spearman_ic
@@ -33,6 +34,7 @@ from quant_platform.models.baselines import FactorComposite, MomentumBaseline, N
 from quant_platform.portfolio.constructors import get_constructor
 from quant_platform.universe.builder import UniverseBuilder
 from quant_platform.utilities.calendar import TradingCalendar
+from quant_platform.utilities.narrow import as_date
 from quant_platform.utilities.reproducibility import get_logger
 
 logger = get_logger("pipeline")
@@ -53,6 +55,11 @@ class PipelineData:
     is_synthetic: bool = True
     benchmark_source: BenchmarkSource = BenchmarkSource.FIXTURE_SYNTHETIC
     feature_columns: list[str] = field(default_factory=list)
+    identifiers: pl.DataFrame = field(default_factory=pl.DataFrame)
+    membership: pl.DataFrame = field(default_factory=pl.DataFrame)
+    fundamentals: pl.DataFrame = field(default_factory=pl.DataFrame)
+    macro: pl.DataFrame = field(default_factory=pl.DataFrame)
+    snapshot_id: str | None = None
 
 
 def build_adjusted_prices(prices: pl.DataFrame, actions: pl.DataFrame) -> pl.DataFrame:
@@ -62,7 +69,7 @@ def build_adjusted_prices(prices: pl.DataFrame, actions: pl.DataFrame) -> pl.Dat
     restated so that returns across a split are continuous. A 2-for-1 split halves every price
     before the ex-date; without it the split looks like a -50% return.
     """
-    px = prices.sort(["security_id", "observation_date"])
+    px = prices.sort(["security_id", "observation_date"]).with_row_index("_price_row")
 
     splits = actions.filter(pl.col("action_type").is_in(["stock_split", "reverse_split"])).select(
         ["security_id", "ex_date", "value"]
@@ -72,95 +79,173 @@ def build_adjusted_prices(prices: pl.DataFrame, actions: pl.DataFrame) -> pl.Dat
         pl.col("action_type").is_in(["cash_dividend", "special_dividend"])
     ).select(["security_id", "ex_date", pl.col("value").alias("dividend")])
 
-    # Split factor: cumulative product of all splits STRICTLY AFTER each date. Prices before
-    # a split must be divided by the ratio.
+    # Each event joins to the historical rows it affects; native Polars aggregation then
+    # forms the cumulative backward factor for the whole panel without Python security loops.
     if splits.is_empty():
         px = px.with_columns(pl.lit(1.0).alias("_split_factor"))
     else:
-        frames = []
-        for sec_id, group in px.group_by("security_id", maintain_order=True):
-            sid = sec_id[0] if isinstance(sec_id, tuple) else sec_id
-            sec_splits = splits.filter(pl.col("security_id") == sid)
-            factor = np.ones(group.height)
-            if not sec_splits.is_empty():
-                dates = group["observation_date"].to_list()
-                for row in sec_splits.iter_rows(named=True):
-                    ex, ratio = row["ex_date"], float(row["value"])
-                    # Every bar strictly before the ex-date gets divided by the ratio.
-                    mask = np.array([d < ex for d in dates])
-                    factor[mask] /= ratio
-            frames.append(group.with_columns(pl.Series("_split_factor", factor)))
-        px = pl.concat(frames)
+        split_effects = (
+            px.select("_price_row", "security_id", "observation_date")
+            .join(splits, on="security_id", how="inner")
+            .filter(pl.col("observation_date") < pl.col("ex_date"))
+            .group_by("_price_row")
+            .agg((1.0 / pl.col("value")).product().alias("_split_factor"))
+        )
+        px = px.join(split_effects, on="_price_row", how="left").with_columns(
+            pl.col("_split_factor").fill_null(1.0)
+        )
 
-    px = px.with_columns((pl.col("close") * pl.col("_split_factor")).alias("adjusted_close"))
-
-    # Dividend adjustment: scale pre-ex-date prices by (1 - D/P) so the ex-date drop is not
-    # counted as a loss. Applied cumulatively backward.
+    dividend_effects = pl.DataFrame(schema={"_price_row": pl.UInt32, "_div_factor": pl.Float64})
     if not divs.is_empty():
-        frames = []
-        for sec_id, group in px.group_by("security_id", maintain_order=True):
-            sid = sec_id[0] if isinstance(sec_id, tuple) else sec_id
-            sec_divs = divs.filter(pl.col("security_id") == sid)
-            adj = group["adjusted_close"].to_numpy().astype(float).copy()
-            if not sec_divs.is_empty():
-                dates = group["observation_date"].to_list()
-                closes = group["close"].to_numpy().astype(float)
-                for row in sec_divs.iter_rows(named=True):
-                    ex, amt = row["ex_date"], float(row["dividend"] or 0.0)
-                    idx = [i for i, d in enumerate(dates) if d < ex]
-                    if not idx or amt <= 0:
-                        continue
-                    ref_price = closes[idx[-1]]
-                    if ref_price <= 0:
-                        continue
-                    ratio = max(1.0 - amt / ref_price, 1e-6)
-                    adj[idx] *= ratio
-            frames.append(group.with_columns(pl.Series("adjusted_close", adj)))
-        px = pl.concat(frames)
-
-    return px.drop("_split_factor").sort(["security_id", "observation_date"])
+        events = divs.with_row_index("_dividend_row")
+        references = (
+            events.join(
+                px.select(
+                    "security_id",
+                    pl.col("observation_date").alias("_reference_date"),
+                    pl.col("close").alias("_reference_close"),
+                ),
+                on="security_id",
+                how="inner",
+            )
+            .filter(pl.col("_reference_date") < pl.col("ex_date"))
+            .sort(["_dividend_row", "_reference_date"])
+            .group_by("_dividend_row")
+            .agg(pl.col("_reference_close").last())
+        )
+        ratios = events.join(references, on="_dividend_row", how="left").with_columns(
+            pl.when(
+                (pl.col("dividend") > 0)
+                & pl.col("_reference_close").is_not_null()
+                & (pl.col("_reference_close") > 0)
+            )
+            .then((1.0 - pl.col("dividend") / pl.col("_reference_close")).clip(1e-6, 1.0))
+            .otherwise(1.0)
+            .alias("_event_div_factor")
+        )
+        dividend_effects = (
+            px.select("_price_row", "security_id", "observation_date")
+            .join(
+                ratios.select("security_id", "ex_date", "_event_div_factor"),
+                on="security_id",
+                how="inner",
+            )
+            .filter(pl.col("observation_date") < pl.col("ex_date"))
+            .group_by("_price_row")
+            .agg(pl.col("_event_div_factor").product().alias("_div_factor"))
+        )
+    px = px.join(dividend_effects, on="_price_row", how="left").with_columns(
+        pl.col("_div_factor").fill_null(1.0)
+    )
+    return (
+        px.with_columns(
+            (pl.col("close") * pl.col("_split_factor") * pl.col("_div_factor")).alias(
+                "adjusted_close"
+            )
+        )
+        .drop("_price_row", "_split_factor", "_div_factor")
+        .sort(["security_id", "observation_date"])
+    )
 
 
 def load_fixture_data(charter: ResearchCharter, n_securities: int = 120) -> PipelineData:
     """Generate the deterministic fixture dataset and derive the panels."""
     spec = FixtureSpec(n_securities=n_securities, seed=charter.random_seed)
     ds = FixtureDataProvider(spec).generate()
-    calendar = TradingCalendar(spec.start, spec.end)
+    return _build_pipeline_data(
+        charter,
+        prices=ds.prices,
+        benchmark=ds.benchmark,
+        securities=ds.securities,
+        identifiers=ds.identifiers,
+        membership=ds.membership,
+        corporate_actions=ds.corporate_actions,
+        fundamentals=ds.fundamentals,
+        macro=ds.macro,
+        is_synthetic=True,
+        benchmark_source=BenchmarkSource.FIXTURE_SYNTHETIC,
+    )
 
-    logger.info("applying corporate-action adjustments")
-    prices = build_adjusted_prices(ds.prices, ds.corporate_actions)
-    benchmark = ds.benchmark.with_columns(pl.col("close").alias("adjusted_close"))
 
-    logger.info("building point-in-time universe")
-    ub = UniverseBuilder(charter.universe, ds.securities, ds.membership, prices)
+def load_snapshot_data(snapshot: DataSnapshot, charter: ResearchCharter) -> PipelineData:
+    """Build the validated PIT research panels rooted at an immutable snapshot."""
+    is_synthetic = "fixture_synthetic" in snapshot.manifest.get("sources", [])
+    return _build_pipeline_data(
+        charter,
+        prices=snapshot.read("prices"),
+        benchmark=snapshot.read("benchmark"),
+        securities=snapshot.read("securities"),
+        identifiers=snapshot.read("identifiers"),
+        membership=snapshot.read("membership"),
+        corporate_actions=snapshot.read("corporate_actions"),
+        fundamentals=snapshot.read("fundamentals"),
+        macro=snapshot.read("macro"),
+        is_synthetic=is_synthetic,
+        benchmark_source=(
+            BenchmarkSource.FIXTURE_SYNTHETIC
+            if is_synthetic
+            else charter.benchmark.preferred_source
+        ),
+        snapshot_id=snapshot.snapshot_id,
+    )
+
+
+def _build_pipeline_data(
+    charter: ResearchCharter,
+    *,
+    prices: pl.DataFrame,
+    benchmark: pl.DataFrame,
+    securities: pl.DataFrame,
+    identifiers: pl.DataFrame,
+    membership: pl.DataFrame,
+    corporate_actions: pl.DataFrame,
+    fundamentals: pl.DataFrame,
+    macro: pl.DataFrame,
+    is_synthetic: bool,
+    benchmark_source: BenchmarkSource,
+    snapshot_id: str | None = None,
+) -> PipelineData:
+    start_value = benchmark["observation_date"].min()
+    end_value = benchmark["observation_date"].max()
+    if start_value is None or end_value is None:
+        raise ValueError("snapshot benchmark has no usable date range")
+    start = as_date(start_value, "snapshot start")
+    end = as_date(end_value, "snapshot end")
+    calendar = TradingCalendar(start, end)
+    logger.info("applying vectorized corporate-action adjustments")
+    adjusted = build_adjusted_prices(prices, corporate_actions)
+    benchmark = benchmark.with_columns(pl.col("close").alias("adjusted_close"))
     signal_dates = calendar.rebalance_sessions(
         charter.backtest.rebalance.frequency, charter.backtest.rebalance.signal_day
     )
-    universe_panel = ub.build_panel(signal_dates)
-
+    logger.info("building point-in-time universe")
+    universe_panel = UniverseBuilder(
+        charter.universe, securities, membership, adjusted
+    ).build_panel(signal_dates)
     logger.info("computing features")
-    features = compute_price_features(prices, benchmark, charter.features.enabled_families)
-
+    features = compute_price_features(adjusted, benchmark, charter.features.enabled_families)
     logger.info("generating labels")
-    gen = LabelGenerator(
+    labels = LabelGenerator(
         charter.label, calendar, charter.backtest.rebalance.execution_delay_sessions
-    )
-    labels = gen.generate(prices, benchmark, ds.securities, signal_dates)
-
-    feature_cols = [c for c in features.columns if c not in ("security_id", "as_of")]
-
+    ).generate(adjusted, benchmark, securities, signal_dates)
+    feature_cols = [column for column in features.columns if column not in ("security_id", "as_of")]
     return PipelineData(
-        prices=prices,
+        prices=adjusted,
         benchmark=benchmark,
-        securities=ds.securities,
-        corporate_actions=ds.corporate_actions,
+        securities=securities,
+        corporate_actions=corporate_actions,
         features=features,
         labels=labels,
         universe_panel=universe_panel,
         calendar=calendar,
-        is_synthetic=True,
-        benchmark_source=BenchmarkSource.FIXTURE_SYNTHETIC,
+        is_synthetic=is_synthetic,
+        benchmark_source=benchmark_source,
         feature_columns=feature_cols,
+        identifiers=identifiers,
+        membership=membership,
+        fundamentals=fundamentals,
+        macro=macro,
+        snapshot_id=snapshot_id,
     )
 
 
@@ -177,6 +262,21 @@ def build_training_frame(data: PipelineData) -> pl.DataFrame:
     )
     sectors = data.securities.select(["security_id", "sector"])
     return df.join(sectors, on="security_id", how="left")
+
+
+def build_prediction_frame(data: PipelineData) -> pl.DataFrame:
+    """Build a label-free PIT frame for forward scoring.
+
+    Production prediction must not inner-join future labels: doing so would unnecessarily
+    stop the usable panel one forecast horizon before the newest validated feature date.
+    Eligibility remains enforced by the same historical universe panel used in research.
+    """
+    frame = data.universe_panel.join(data.features, on=["security_id", "as_of"], how="inner").sort(
+        ["as_of", "security_id"]
+    )
+    return frame.join(
+        data.securities.select(["security_id", "sector"]), on="security_id", how="left"
+    )
 
 
 def split_train_test(
@@ -235,6 +335,7 @@ def run_backtest_for_predictions(
     constructor_name: str,
     cost_scenario: str = "base",
     strategy_name: str | None = None,
+    prepared: PreparedMarketData | None = None,
 ) -> BacktestResult:
     """Turn predictions into targets and simulate."""
     constructor = get_constructor(constructor_name, charter.portfolio)
@@ -245,25 +346,57 @@ def run_backtest_for_predictions(
         predictions = predictions.join(vol, on=["security_id", "as_of"], how="left")
 
     targets_by_date: dict[date, dict[str, float]] = {}
+    diagnostics = {}
     previous: dict[str, float] = {}
     for as_of, group in predictions.group_by("as_of", maintain_order=True):
         d = as_of[0] if isinstance(as_of, tuple) else as_of
-        weights, _diag = constructor.build(group, previous, d)
+        if constructor_name == "constrained_optimizer":
+            from quant_platform.portfolio.constrained_optimizer import (
+                ConstrainedOptimizer,
+                benchmark_sector_weights,
+            )
+            from quant_platform.risk.covariance import estimate_covariance
+
+            if not isinstance(constructor, ConstrainedOptimizer):
+                raise TypeError("constrained_optimizer registry returned the wrong type")
+
+            ids = group["security_id"].to_list()
+            risk_model = estimate_covariance(data.prices, ids, d, charter.risk, data.benchmark)
+            sector_map = {
+                row["security_id"]: row["sector"]
+                for row in data.securities.select("security_id", "sector").iter_rows(named=True)
+            }
+            weights, diag = constructor.build(
+                group,
+                previous,
+                d,
+                risk_model=risk_model,
+                sector_map=sector_map,
+                benchmark_sector_weights=benchmark_sector_weights(data.securities, ids),
+                portfolio_value=charter.backtest.initial_capital,
+            )
+        else:
+            weights, diag = constructor.build(group, previous, d)
         if weights:
             targets_by_date[d] = weights
+            diagnostics[d] = diag
             previous = weights
 
     engine = BacktestEngine(
         charter.backtest, charter.costs, data.calendar, cost_scenario=cost_scenario
     )
-    return engine.run(
+    result = engine.run(
         targets_by_date,
         data.prices,
         data.benchmark,
         data.securities,
         dividends=data.corporate_actions,
         strategy_name=strategy_name or f"{constructor_name}_{cost_scenario}",
+        prepared=prepared,
     )
+    result.target_weights = targets_by_date
+    result.diagnostics = diagnostics
+    return result
 
 
 def evaluate(

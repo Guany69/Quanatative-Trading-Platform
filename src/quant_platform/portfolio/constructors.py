@@ -88,10 +88,19 @@ class PortfolioConstructor(ABC):
         heaviest = max(weights.values())
         if heaviest > self.config.max_position_weight + 1e-6:
             violations["max_position_weight"] = heaviest
+        lightest = min(weights.values())
+        if lightest < self.config.min_position_weight - 1e-6:
+            violations["min_position_weight"] = lightest
+        if len(weights) < self.config.min_holdings:
+            violations["min_holdings"] = float(len(weights))
+        if len(weights) > self.config.max_holdings:
+            violations["max_holdings"] = float(len(weights))
         total = sum(weights.values())
         budget = 1.0 - self.config.cash_buffer
         if total > budget + 1e-6:
             violations["budget"] = total
+        if self.config.fully_invested and abs(total - budget) > 1e-5:
+            violations["fully_invested"] = total
         if violations:
             raise AssertionError(
                 f"{self.name} produced weights violating hard constraints: {violations}. "
@@ -154,12 +163,18 @@ class ScoreWeightedConstructor(PortfolioConstructor):
         n = min(candidates.height, self.config.max_holdings)
         top = candidates.sort("cross_sectional_rank", descending=True).head(n)
 
-        ranks = top["cross_sectional_rank"].to_numpy()
+        ranks = top["cross_sectional_rank"].to_numpy().astype(float)
         # Shift so the weakest selected name gets ~0 weight and weights stay non-negative.
         scores = ranks - ranks.min() + 1e-6
-        raw = scores / scores.sum() * (1.0 - self.config.cash_buffer)
-        capped = _apply_cap_and_redistribute(
-            raw, self.config.max_position_weight, 1.0 - self.config.cash_buffer
+        if self.config.score_transform == "power":
+            scores = scores**self.config.score_power
+        elif self.config.score_transform == "softmax":
+            scores = np.exp((ranks - ranks.max()) / self.config.score_temperature)
+        capped = _allocate_with_bounds(
+            scores,
+            self.config.min_position_weight,
+            self.config.max_position_weight,
+            1.0 - self.config.cash_buffer,
         )
         weights = {
             sid: float(w)
@@ -210,9 +225,11 @@ class InverseVolatilityConstructor(PortfolioConstructor):
             np.nanmedian(vol[np.isfinite(vol)]) if np.isfinite(vol).any() else 0.25,
         )
         inv = 1.0 / vol
-        raw = inv / inv.sum() * (1.0 - self.config.cash_buffer)
-        capped = _apply_cap_and_redistribute(
-            raw, self.config.max_position_weight, 1.0 - self.config.cash_buffer
+        capped = _allocate_with_bounds(
+            inv,
+            self.config.min_position_weight,
+            self.config.max_position_weight,
+            1.0 - self.config.cash_buffer,
         )
         weights = {
             sid: float(w)
@@ -262,6 +279,21 @@ def _apply_cap_and_redistribute(
     return np.minimum(w, cap)
 
 
+def _allocate_with_bounds(
+    strength: np.ndarray, floor: float, cap: float, budget: float
+) -> np.ndarray:
+    """Allocate a budget proportionally while honoring configured position bounds."""
+    values = np.maximum(np.asarray(strength, dtype=float), 0.0)
+    n = len(values)
+    if n == 0 or floor * n > budget + 1e-9:
+        return np.zeros(n)
+    remainder = max(0.0, budget - floor * n)
+    if values.sum() <= 1e-12:
+        values = np.ones(n)
+    raw = np.full(n, floor) + remainder * values / values.sum()
+    return _apply_cap_and_redistribute(raw, cap, budget)
+
+
 def _turnover(new: dict[str, float], old: dict[str, float]) -> float:
     """One-way turnover between two weight vectors."""
     keys = set(new) | set(old)
@@ -275,6 +307,11 @@ def get_constructor(name: str, config: PortfolioConfig) -> PortfolioConstructor:
         "score_weighted": ScoreWeightedConstructor,
         "inverse_volatility": InverseVolatilityConstructor,
     }
+    if name == "constrained_optimizer":
+        from quant_platform.portfolio.constrained_optimizer import ConstrainedOptimizer
+
+        return ConstrainedOptimizer(config)
     if name not in table:
-        raise KeyError(f"unknown portfolio constructor '{name}'; known: {sorted(table)}")
+        known = [*sorted(table), "constrained_optimizer"]
+        raise KeyError(f"unknown portfolio constructor '{name}'; known: {known}")
     return table[name](config)

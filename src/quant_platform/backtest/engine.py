@@ -28,7 +28,11 @@ import polars as pl
 from quant_platform.config.models import BacktestConfig, CostConfig
 from quant_platform.costs.model import CompositeCostModel, TradeContext
 from quant_platform.domain.enums import OrderSide
-from quant_platform.domain.portfolio import BacktestSnapshot, TransactionCost
+from quant_platform.domain.portfolio import (
+    BacktestSnapshot,
+    OptimizationDiagnostics,
+    TransactionCost,
+)
 from quant_platform.utilities.calendar import TradingCalendar
 from quant_platform.utilities.reproducibility import get_logger
 
@@ -39,9 +43,11 @@ logger = get_logger("backtest")
 class TradeRecord:
     """One executed trade, with the full timestamp chain retained for audit."""
 
+    information_date: date
     signal_date: date
     order_date: date
     fill_date: date
+    accounting_date: date
     security_id: str
     side: str
     shares: float
@@ -68,6 +74,8 @@ class BacktestResult:
     initial_capital: float = 0.0
     cost_scenario: str = "base"
     execution_delay_sessions: int = 1
+    target_weights: dict[date, dict[str, float]] = field(default_factory=dict)
+    diagnostics: dict[date, OptimizationDiagnostics] = field(default_factory=dict)
 
     def equity_curve(self) -> pl.DataFrame:
         return pl.DataFrame(
@@ -90,9 +98,11 @@ class BacktestResult:
         if not self.trades:
             return pl.DataFrame(
                 schema={
+                    "information_date": pl.Date,
                     "signal_date": pl.Date,
                     "order_date": pl.Date,
                     "fill_date": pl.Date,
+                    "accounting_date": pl.Date,
                     "security_id": pl.Utf8,
                     "side": pl.Utf8,
                     "shares": pl.Float64,
@@ -110,6 +120,21 @@ class BacktestResult:
     @property
     def total_costs(self) -> float:
         return sum(t.total_cost for t in self.trades)
+
+
+@dataclass(frozen=True)
+class PreparedMarketData:
+    """Pre-indexed inputs shared across strategy/scenario simulations."""
+
+    px_map: dict[tuple[str, date], float]
+    adv_map: dict[tuple[str, date], float]
+    vol_map: dict[tuple[str, date], float]
+    bench_map: dict[date, float]
+    div_map: dict[tuple[str, date], float]
+    delist_map: dict[str, tuple[date, float]]
+    security_index: dict[str, int]
+    session_index: dict[date, int]
+    price_matrix: np.ndarray
 
 
 class BacktestEngine:
@@ -141,6 +166,7 @@ class BacktestEngine:
         securities: pl.DataFrame,
         dividends: pl.DataFrame | None = None,
         strategy_name: str = "strategy",
+        prepared: PreparedMarketData | None = None,
     ) -> BacktestResult:
         """Run the simulation.
 
@@ -150,10 +176,13 @@ class BacktestEngine:
             Target weights keyed by SIGNAL date. The engine itself applies the execution
             delay, so callers cannot accidentally trade too early.
         """
-        px_map, adv_map, vol_map = self._index_prices(prices)
-        bench_map = self._index_benchmark(benchmark)
-        div_map = self._index_dividends(dividends)
-        delist_map = self._index_delistings(securities)
+        prepared = prepared or self.prepare_inputs(prices, benchmark, securities, dividends)
+        px_map, adv_map, vol_map = prepared.px_map, prepared.adv_map, prepared.vol_map
+        bench_map, div_map, delist_map = (
+            prepared.bench_map,
+            prepared.div_map,
+            prepared.delist_map,
+        )
 
         # Map each signal date to the session the orders actually execute on.
         fill_dates: dict[date, date] = {}
@@ -188,7 +217,7 @@ class BacktestEngine:
 
             # 2. Value the book at today's close using pre-trade positions. This is the
             #    gross mark: what the portfolio earned from market moves alone.
-            pre_trade_value = cash + self._positions_value(positions, session, px_map)
+            pre_trade_value = cash + self._positions_value(positions, session, prepared)
             gross_return = (pre_trade_value / prev_value - 1.0) if prev_value > 1e-9 else 0.0
 
             # 3. Trade only if today is a scheduled FILL date (signal + delay).
@@ -209,7 +238,7 @@ class BacktestEngine:
                 result.trades.extend(trades)
 
             # 4. Post-trade valuation: costs have now been deducted, so this is the net mark.
-            positions_value = self._positions_value(positions, session, px_map)
+            positions_value = self._positions_value(positions, session, prepared)
             total_value = cash + positions_value
             net_return = (total_value / prev_value - 1.0) if prev_value > 1e-9 else 0.0
 
@@ -231,6 +260,43 @@ class BacktestEngine:
             prev_value = total_value
 
         return result
+
+    def prepare_inputs(
+        self,
+        prices: pl.DataFrame,
+        benchmark: pl.DataFrame,
+        securities: pl.DataFrame,
+        dividends: pl.DataFrame | None = None,
+    ) -> PreparedMarketData:
+        """Prepare price matrices once and reuse them across strategy variants."""
+        px_map, adv_map, vol_map = self._index_prices(prices)
+        security_ids = sorted(prices["security_id"].unique().to_list())
+        sessions = list(self.calendar.sessions)
+        security_index = {security_id: idx for idx, security_id in enumerate(security_ids)}
+        session_index = {session: idx for idx, session in enumerate(sessions)}
+        wide = prices.select("observation_date", "security_id", "adjusted_close").pivot(
+            values="adjusted_close", index="observation_date", on="security_id"
+        )
+        dense = (
+            pl.DataFrame({"observation_date": sessions})
+            .join(wide, on="observation_date", how="left")
+            .select("observation_date", *security_ids)
+            .with_columns(pl.col(security_ids).forward_fill())
+        )
+        # Between exact events positions are constant; carrying forward a halted name's last
+        # mark and valuing with a NumPy dot removes dict math from the hot path.
+        matrix = dense.select(security_ids).to_numpy().astype(float)
+        return PreparedMarketData(
+            px_map=px_map,
+            adv_map=adv_map,
+            vol_map=vol_map,
+            bench_map=self._index_benchmark(benchmark),
+            div_map=self._index_dividends(dividends),
+            delist_map=self._index_delistings(securities),
+            security_index=security_index,
+            session_index=session_index,
+            price_matrix=matrix,
+        )
 
     # ------------------------------------------------------------------ internals
     def _index_prices(self, prices: pl.DataFrame):
@@ -311,15 +377,23 @@ class BacktestEngine:
             )
         return out
 
-    def _positions_value(self, positions, session, px_map) -> float:
-        """Mark positions at today's close, carrying forward the last price if absent."""
-        total = 0.0
-        for sid, shares in positions.items():
-            price = px_map.get((sid, session))
-            if price is None:
-                continue  # stale/halted: value carried via cash-neutral hold
-            total += shares * price
-        return total
+    def _positions_value(self, positions, session, prepared: PreparedMarketData) -> float:
+        """Vectorized mark using the pre-indexed, forward-filled price matrix."""
+        row = prepared.session_index.get(session)
+        if row is None or not positions:
+            return 0.0
+        pairs = [
+            (prepared.security_index[security_id], shares)
+            for security_id, shares in positions.items()
+            if security_id in prepared.security_index
+        ]
+        if not pairs:
+            return 0.0
+        indices = np.fromiter((pair[0] for pair in pairs), dtype=np.int64)
+        shares = np.fromiter((pair[1] for pair in pairs), dtype=float)
+        marks = prepared.price_matrix[row, indices]
+        valid = np.isfinite(marks)
+        return float(np.dot(shares[valid], marks[valid]))
 
     def _apply_corporate_actions(self, positions, cash, session, div_map, delist_map, px_map):
         """Pay dividends and liquidate delisted names on their ex-date."""
@@ -439,9 +513,11 @@ class BacktestEngine:
             )
             trades.append(
                 TradeRecord(
+                    information_date=signal_date,
                     signal_date=signal_date,
                     order_date=session,
                     fill_date=session,
+                    accounting_date=session,
                     security_id=sid,
                     side=OrderSide.BUY.value if delta > 0 else OrderSide.SELL.value,
                     shares=abs(delta),

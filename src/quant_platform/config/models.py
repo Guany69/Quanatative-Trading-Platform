@@ -118,6 +118,10 @@ class PortfolioConfig(StrictConfig):
     cash_buffer: float = Field(default=0.0, ge=0, lt=1.0)
     min_trade_size: float = Field(default=0.0, ge=0, description="Minimum trade notional.")
     restricted_securities: list[str] = Field(default_factory=list)
+    score_transform: Literal["linear", "power", "softmax"] = "linear"
+    score_power: float = Field(default=1.0, gt=0)
+    score_temperature: float = Field(default=0.20, gt=0)
+    allow_constraint_relaxation: bool = True
 
     @model_validator(mode="after")
     def _check_coherence(self) -> PortfolioConfig:
@@ -286,7 +290,6 @@ class DataSourceConfig(StrictConfig):
     corporate_actions: str = "fixture"
     cache_dir: str = "data/interim"
     raw_dir: str = "data/raw"
-    processed_dir: str = "data/processed"
 
 
 class PaperTradingConfig(StrictConfig):

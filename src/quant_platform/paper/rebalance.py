@@ -283,6 +283,9 @@ def record_rebalance(
         notes="; ".join(reconciliation.warnings),
     )
     state.rebalances.append(record)
+    state.record_decisions(proposals)
+    state.record_fills(fills)
+    state.record_reconciliation(reconciliation)
     state.clear_proposals()
     return record
 

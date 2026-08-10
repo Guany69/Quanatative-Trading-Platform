@@ -32,7 +32,9 @@ def _history(ticker: str = "AAPL", last_day: date = date(2026, 7, 22)) -> pl.Dat
     )
 
 
-def _quote(ticker: str = "AAPL", session: date = date(2026, 7, 23), price: float = 99.0) -> LiveQuote:
+def _quote(
+    ticker: str = "AAPL", session: date = date(2026, 7, 23), price: float = 99.0
+) -> LiveQuote:
     return LiveQuote(
         ticker=ticker,
         price=price,

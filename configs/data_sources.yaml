@@ -7,4 +7,3 @@ constituents: fixture
 corporate_actions: fixture
 cache_dir: data/interim
 raw_dir: data/raw
-processed_dir: data/processed

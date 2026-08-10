@@ -220,6 +220,23 @@ class TestInfeasibilityAndRelaxation:
             assert max(weights.values()) <= impossible.max_position_weight + 1e-6
         assert diag.relaxations_applied
 
+    def test_prohibited_relaxation_fails_loudly(self):
+        rm = _risk_model(n=25)
+        mandate = PortfolioConfig(
+            min_holdings=24,
+            max_holdings=25,
+            max_position_weight=0.05,
+            min_position_weight=0.04,
+            max_turnover_per_rebalance=0.001,
+            min_beta=1.999,
+            max_beta=2.0,
+            allow_constraint_relaxation=False,
+        )
+        with pytest.raises(RuntimeError, match="prohibits constraint relaxation"):
+            ConstrainedOptimizer(mandate).build(
+                _candidates(25), {}, date(2021, 6, 15), risk_model=rm
+            )
+
 
 class TestDiagnostics:
     def test_diagnostics_are_populated(self):
@@ -253,6 +270,20 @@ class TestSimpleConstructors:
         weights, _ = ScoreWeightedConstructor(cfg).build(_candidates(), {}, date(2021, 6, 15))
         assert max(weights.values()) <= 0.04 + 1e-9
         assert sum(weights.values()) <= 1.0 + 1e-6
+
+    def test_score_transform_is_configurable(self):
+        base = PortfolioConfig(
+            min_holdings=10,
+            max_holdings=20,
+            max_position_weight=0.20,
+            min_position_weight=0.0,
+        )
+        linear, _ = ScoreWeightedConstructor(base).build(_candidates(40), {}, date(2021, 6, 15))
+        softmax, _ = ScoreWeightedConstructor(
+            base.model_copy(update={"score_transform": "softmax", "score_temperature": 0.05})
+        ).build(_candidates(40), {}, date(2021, 6, 15))
+        assert set(linear) == set(softmax)
+        assert any(abs(linear[key] - softmax[key]) > 1e-4 for key in linear)
 
     def test_inverse_volatility_favours_low_vol_names(self):
         cfg = PortfolioConfig(min_holdings=10, max_holdings=40, max_position_weight=0.10)

@@ -2,23 +2,25 @@
 
 ## Data flow
 
-```
-providers (fixture | local files | open data)
-  -> data validation           (fail fast on CRITICAL issues)
-  -> security master           (permanent IDs, symbol history, delistings)
-  -> point-in-time universe    (membership + eligibility as of each date)
-  -> features                  (trailing windows only; available_at gating)
-  -> labels                    (20-session forward excess return + delay)
-  -> walk-forward split        (purge overlapping windows + embargo)
-  -> preprocessing             (FITTED ON TRAIN ONLY)
-  -> models                    (baselines + ML + ensemble)
-  -> predictions               (cross-sectional ranks)
-  -> portfolio construction    (equal / score / inverse-vol / optimizer)
-  -> backtest engine           (execution delay, costs, corporate actions)
-  -> evaluation                (forecast + portfolio metrics)
-  -> stress + overfitting stats
-  -> reports                   (JSON, CSV, Markdown, HTML, charts)
-  -> paper trading             (proposals -> HUMAN APPROVAL -> simulated fills)
+```text
+Researcher -> CLI -> ExperimentRunOrchestrator (sole batch owner)
+  -> SnapshotStore: validated immutable provider frames + hashes
+  -> PIT builder -> PitPanelCache: content-keyed train/validation/test Parquet
+  -> WalkForwardSplitter: expanding folds + purge + embargo + locked holdout exclusion
+  -> TrainingExecutor: process-level (model, fold) tasks; train-only preprocessing
+       -> ModelRegistry -> run/model/fold artifacts
+       <- predictions + validation-safe ensemble inputs (workers never write DuckDB)
+  -> four PortfolioConstructors -> shared risk/cost inputs -> BacktestEngine
+  -> stress / DSR / PBO / placebo / regime evaluation
+  -> ResultsStore: parent-process Arrow batches -> authoritative DuckDB
+  -> ExperimentRegistry: append-only trial linkage, including rejected runs
+  -> persisted-results reporter -> run-scoped HTML/MD/JSON/CSV/charts
+
+CLI -> PaperTradingCoordinator
+  -> designated completed run + immutable snapshot + stored model/preprocessor artifact
+  -> shared PIT feature path -> strategy -> recorded proposals
+  -> HUMAN APPROVAL/REJECTION -> >=1-session delayed SimulatedBroker only
+  -> fills + unfilled orders + reconciliation -> atomic forward-only PaperTradingState
 ```
 
 ## The five timestamps
@@ -53,6 +55,22 @@ of fake alpha:
 | `evaluation/` | Metrics, factor diagnostics, reports. |
 | `execution/` + `paper/` | Broker interface, approval gate, persistent paper state. |
 | `experiments/` | Append-only trial registry (feeds multiple-testing corrections). |
+| `research/` | Run orchestration, process executor, PIT cache, DuckDB ownership, holdout. |
+
+## Storage ownership
+
+| Store | Role | Writer |
+|---|---|---|
+| `data/snapshots/<snapshot_id>/` | Permanent immutable Parquet + manifest root | `SnapshotStore` |
+| `data/interim/pit_cache/<key>/` | Disposable validated fold panels | `PitPanelCache` |
+| `research.duckdb` | Authoritative runs, predictions, metrics, strategies and trades | Parent `ResultsStore` |
+| `artifacts/models/<run>/<model>/<fold>/` | Reloadable model/preprocessor and metadata | Orchestrator |
+| `artifacts/experiments.jsonl` | Append-only attempted/rejected trial history | `ExperimentRegistry` |
+| `paper_state/state.json` | Separate forward paper decisions/fills/reconciliation | `PaperTradingState` |
+| `reports/<run>/` | Regenerable presentation exports, never authority | Persisted reporter |
+
+Workers do not receive or import `ResultsStore`; the owning parent writes complete logical
+stages through Arrow-backed transactions. Failed runs remain queryable with stage and cause.
 
 ## Point-in-time handling
 

@@ -2969,6 +2969,7 @@ name = "quant-platform"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "duckdb" },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "pandas" },
@@ -2986,7 +2987,6 @@ dependencies = [
 
 [package.optional-dependencies]
 data = [
-    { name = "duckdb" },
     { name = "requests" },
     { name = "yfinance" },
 ]
@@ -3018,7 +3018,7 @@ tracking = [
 [package.metadata]
 requires-dist = [
     { name = "cvxpy", marker = "extra == 'optimization'", specifier = ">=1.5" },
-    { name = "duckdb", marker = "extra == 'data'", specifier = ">=1.0" },
+    { name = "duckdb", specifier = ">=1.0" },
     { name = "lightgbm", marker = "extra == 'ml'", specifier = ">=4.3" },
     { name = "matplotlib", specifier = ">=3.8" },
     { name = "mlflow", marker = "extra == 'tracking'", specifier = ">=2.14" },

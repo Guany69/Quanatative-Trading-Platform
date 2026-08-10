@@ -149,6 +149,9 @@ class TestExecutionDelay:
                 f"trade filled on {trade.fill_date} from a signal dated "
                 f"{trade.signal_date}: this is trading at a price the signal already saw"
             )
+            assert trade.order_date > trade.signal_date
+            assert trade.fill_date >= trade.order_date
+            assert trade.accounting_date >= trade.fill_date
             assert trade.fill_date == sessions[11]
 
     def test_longer_delay_pushes_fills_further_out(self):

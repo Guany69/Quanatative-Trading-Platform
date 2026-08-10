@@ -127,7 +127,10 @@ class ConstrainedOptimizer(PortfolioConstructor):
         beta_widen = 0.0
         applied: list[str] = []
 
-        for attempt in range(len(DEFAULT_RELAXATION_ORDER) + 1):
+        relaxation_order = (
+            DEFAULT_RELAXATION_ORDER if self.config.allow_constraint_relaxation else []
+        )
+        for attempt in range(len(relaxation_order) + 1):
             result = self._solve(
                 eligible,
                 previous,
@@ -154,10 +157,10 @@ class ConstrainedOptimizer(PortfolioConstructor):
                 self._verify(result.weights, result.diagnostics)
                 return result.weights, result.diagnostics
 
-            if attempt >= len(DEFAULT_RELAXATION_ORDER):
+            if attempt >= len(relaxation_order):
                 break
 
-            step = DEFAULT_RELAXATION_ORDER[attempt]
+            step = relaxation_order[attempt]
             if step.apply == "_beta_widen":
                 beta_widen += 0.15
             elif step.apply == "min_position_weight":
@@ -170,6 +173,11 @@ class ConstrainedOptimizer(PortfolioConstructor):
                 setattr(working, step.apply, getattr(working, step.apply) * step.factor)
             applied.append(f"{step.name}: {step.description}")
             logger.info("optimization infeasible on %s; relaxing: %s", as_of, step.description)
+
+        if not self.config.allow_constraint_relaxation:
+            raise RuntimeError(
+                f"optimizer infeasible on {as_of} and mandate prohibits constraint relaxation"
+            )
 
         # Every relaxation exhausted: fall back to a feasible score-weighted allocation
         # rather than emitting weights that violate the mandate.

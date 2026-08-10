@@ -34,6 +34,10 @@ class OrderNotApprovedError(RuntimeError):
     """Raised when an unapproved order is submitted for execution."""
 
 
+class ExecutionTimingError(RuntimeError):
+    """Raised when a proposal collapses signal and simulated fill onto one session."""
+
+
 @dataclass
 class OrderProposal:
     """A proposed order awaiting human review.
@@ -58,6 +62,16 @@ class OrderProposal:
     approved_at: datetime | None = None
     approved_by: str | None = None
     rejection_reason: str | None = None
+    rejected_at: datetime | None = None
+    rejected_by: str | None = None
+
+    @property
+    def status(self) -> OrderStatus:
+        if self.approved:
+            return OrderStatus.APPROVED
+        if self.rejection_reason is not None:
+            return OrderStatus.REJECTED
+        return OrderStatus.PROPOSED
 
     @property
     def notional(self) -> float:
@@ -145,6 +159,11 @@ class SimulatedBroker(BrokerAdapter):
                 f"order {proposal.order_id} ({proposal.security_id}) has not been approved. "
                 f"Paper-trading orders remain proposals until a human approves them; call "
                 f"approve() first."
+            )
+        if proposal.order_date <= proposal.signal_date:
+            raise ExecutionTimingError(
+                f"order {proposal.order_id} would fill on {proposal.order_date}, not later than "
+                f"its signal date {proposal.signal_date}; paper fills require >= 1 session delay"
             )
         if market_price <= 0:
             self.rejected.append((proposal, "no valid market price"))
@@ -306,3 +325,24 @@ def approve(
         "approved %d of %d proposed orders (by %s)", len(approved), len(proposals), approver
     )
     return approved
+
+
+def reject(
+    proposals: list[OrderProposal],
+    approver: str,
+    reason: str,
+    order_ids: list[str] | None = None,
+) -> list[OrderProposal]:
+    """Record an explicit human rejection decision for selected proposals."""
+    now = datetime.now()
+    wanted = set(order_ids) if order_ids else None
+    rejected: list[OrderProposal] = []
+    for proposal in proposals:
+        if wanted is not None and proposal.order_id not in wanted:
+            continue
+        proposal.approved = False
+        proposal.rejection_reason = reason
+        proposal.rejected_at = now
+        proposal.rejected_by = approver
+        rejected.append(proposal)
+    return rejected
