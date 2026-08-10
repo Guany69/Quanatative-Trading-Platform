@@ -11,10 +11,14 @@ venv/
 # Environment / secrets
 .env
 .env.*
-!.env.example
+.env.example
 *.pem
 *.key
 credentials.json
+
+# Local build and licence files (kept out of version control)
+LICENSE
+Makefile
 
 # Data & artifacts (never commit generated or proprietary data)
 data/raw/*
@@ -32,10 +36,14 @@ reports/*
 mlruns/
 paper_state/
 
-# Tooling caches
+# Caches (tooling and downloaded data)
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.cache/
+cache/
+*_cache/
+*.cache
 .coverage
 htmlcov/
 
