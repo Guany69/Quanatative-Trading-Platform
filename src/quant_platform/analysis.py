@@ -1,0 +1,594 @@
+"""Single-stock factor scorecard against a peer universe.
+
+This platform ranks securities *cross-sectionally*; it does not score a stock in isolation.
+"AAPL's 12-month momentum is 0.23" is close to meaningless on its own -- the number only
+becomes a signal when compared against a peer group ("87th percentile"). Every function here
+therefore requires a peer universe, and the scorecard reports percentiles rather than raw
+values wherever a percentile is the honest unit.
+
+What this module can and cannot say
+-----------------------------------
+It CAN say: where a stock currently sits, relative to its peers, on momentum, risk, and
+liquidity factors, and what the transparent factor composite makes of that combination.
+
+It CANNOT say whether the stock is a good investment. The composite is a descriptive summary
+of the factor characteristics a stock exhibits today. It is not a forecast, it carries no
+statistical guarantee, and the pillars it can evaluate here are limited (see below).
+
+Known gaps in this path, stated plainly:
+
+* **Only price-derived factors are available.** yfinance supplies prices, not point-in-time
+  fundamentals, so the value and quality pillars are inert. The composite renormalizes across
+  the pillars it can actually evaluate and reports which those were -- it does not quietly
+  treat missing pillars as neutral.
+* **The peer universe is survivorship-biased.** It is a list of currently-listed large caps.
+  Companies that failed are absent by construction, which flatters any historical comparison.
+* **The peer list is an approximation**, not the real S&P 500. Index membership is not
+  available from free sources (see docs/limitations.md).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+from typing import Any
+
+import numpy as np
+import polars as pl
+
+from quant_platform.features.compute import compute_price_features
+from quant_platform.utilities.narrow import as_date
+from quant_platform.utilities.reproducibility import get_logger
+
+logger = get_logger("analysis")
+
+BENCHMARK_TICKER = "SPY"
+
+# A diversified set of large, liquid US listings used as the default peer group.
+#
+# This is an APPROXIMATION of a large-cap universe, not the S&P 500: it is a fixed list of
+# names that are listed *today*, so it is survivorship-biased by construction and its
+# composition does not change with history. It exists to make cross-sectional ranking
+# possible at all; supply your own list when the comparison matters.
+DEFAULT_PEER_UNIVERSE: tuple[str, ...] = (
+    # Information technology
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AVGO",
+    "ORCL",
+    "CRM",
+    "AMD",
+    "ADBE",
+    "CSCO",
+    "ACN",
+    "INTC",
+    "IBM",
+    "QCOM",
+    "TXN",
+    "INTU",
+    "NOW",
+    "AMAT",
+    "MU",
+    "ADI",
+    "LRCX",
+    # Communication services
+    "GOOGL",
+    "META",
+    "NFLX",
+    "DIS",
+    "CMCSA",
+    "VZ",
+    "T",
+    "TMUS",
+    "EA",
+    "OMC",
+    # Consumer discretionary
+    "AMZN",
+    "TSLA",
+    "HD",
+    "MCD",
+    "NKE",
+    "LOW",
+    "SBUX",
+    "TJX",
+    "BKNG",
+    "GM",
+    # Consumer staples
+    "WMT",
+    "PG",
+    "KO",
+    "PEP",
+    "COST",
+    "PM",
+    "MO",
+    "MDLZ",
+    "CL",
+    "KMB",
+    # Health care
+    "UNH",
+    "JNJ",
+    "LLY",
+    "ABBV",
+    "MRK",
+    "PFE",
+    "TMO",
+    "ABT",
+    "DHR",
+    "BMY",
+    "AMGN",
+    "GILD",
+    "CVS",
+    "MDT",
+    "ISRG",
+    # Financials
+    "BRK-B",
+    "JPM",
+    "V",
+    "MA",
+    "BAC",
+    "WFC",
+    "GS",
+    "MS",
+    "AXP",
+    "BLK",
+    "SCHW",
+    "C",
+    "SPGI",
+    "CB",
+    "PGR",
+    # Industrials
+    "CAT",
+    "BA",
+    "HON",
+    "UNP",
+    "GE",
+    "RTX",
+    "LMT",
+    "DE",
+    "UPS",
+    "MMM",
+    # Energy
+    "XOM",
+    "CVX",
+    "COP",
+    "SLB",
+    "EOG",
+    "PSX",
+    "MPC",
+    "VLO",
+    # Utilities / real estate / materials
+    "NEE",
+    "DUK",
+    "SO",
+    "D",
+    "AMT",
+    "PLD",
+    "LIN",
+    "APD",
+    "SHW",
+    "NEM",
+)
+
+# Factor families, with the sign that makes "higher = more of this characteristic".
+_SCORECARD_FACTORS: dict[str, list[tuple[str, float, str]]] = {
+    "momentum": [
+        ("momentum_252d", 1.0, "12-month price momentum"),
+        ("momentum_126d", 1.0, "6-month price momentum"),
+        ("momentum_12m_ex1m", 1.0, "12-month momentum excluding last month"),
+        ("dist_52w_high", 1.0, "proximity to 52-week high"),
+        ("trend_r2_63d", 1.0, "trend consistency (R^2)"),
+    ],
+    "reversal": [
+        ("reversal_5d", 1.0, "1-week reversal (recent losers score higher)"),
+        ("reversal_21d", 1.0, "1-month reversal"),
+    ],
+    "defensive": [
+        ("volatility_252d", -1.0, "1-year realized volatility (lower is more defensive)"),
+        ("beta_252d", -1.0, "market beta (lower is more defensive)"),
+        ("idio_vol_252d", -1.0, "idiosyncratic volatility"),
+        ("max_drawdown_252d", 1.0, "1-year max drawdown (shallower is better)"),
+        ("downside_vol_60d", -1.0, "downside volatility"),
+    ],
+    "liquidity": [
+        ("adv_21d", 1.0, "average daily dollar volume"),
+        ("amihud_illiquidity_21d", -1.0, "Amihud illiquidity (lower is more liquid)"),
+        ("spread_proxy_21d", -1.0, "estimated bid-ask spread"),
+    ],
+}
+
+# Pillars that cannot be evaluated without point-in-time fundamentals.
+UNAVAILABLE_PILLARS = {
+    "value": "needs point-in-time fundamentals (earnings, book value, cash flow)",
+    "quality": "needs point-in-time fundamentals (margins, ROE, leverage)",
+}
+
+
+@dataclass
+class FactorScore:
+    """One factor's standing for a stock relative to its peers."""
+
+    name: str
+    description: str
+    raw_value: float
+    percentile: float  # 0-100, where 100 = strongest on this characteristic
+    peer_median: float
+
+    @property
+    def label(self) -> str:
+        """Plain-language bucket. Deliberately coarse: percentile precision implies more
+        resolution than a ~100-name cross-section actually supports."""
+        if self.percentile >= 80:
+            return "very high"
+        if self.percentile >= 60:
+            return "high"
+        if self.percentile >= 40:
+            return "average"
+        if self.percentile >= 20:
+            return "low"
+        return "very low"
+
+
+@dataclass
+class Scorecard:
+    """A stock's factor standing versus its peer group."""
+
+    ticker: str
+    as_of: date
+    price: float
+    peer_count: int
+    factors: dict[str, list[FactorScore]] = field(default_factory=dict)
+    family_percentiles: dict[str, float] = field(default_factory=dict)
+    composite_percentile: float = float("nan")
+    composite_rank: int = 0
+    unavailable_pillars: dict[str, str] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ticker": self.ticker,
+            "as_of": str(self.as_of),
+            "price": self.price,
+            "peer_count": self.peer_count,
+            "composite_percentile": self.composite_percentile,
+            "composite_rank": self.composite_rank,
+            "family_percentiles": self.family_percentiles,
+            "factors": {
+                family: [
+                    {
+                        "name": f.name,
+                        "description": f.description,
+                        "raw_value": f.raw_value,
+                        "percentile": f.percentile,
+                        "peer_median": f.peer_median,
+                        "label": f.label,
+                    }
+                    for f in scores
+                ]
+                for family, scores in self.factors.items()
+            },
+            "unavailable_pillars": self.unavailable_pillars,
+            "warnings": self.warnings,
+        }
+
+
+def fetch_universe_prices(
+    tickers: list[str],
+    lookback_days: int = 600,
+    end: date | None = None,
+) -> tuple[pl.DataFrame, pl.DataFrame, list[str]]:
+    """Download prices for the tickers plus the benchmark.
+
+    ``lookback_days`` defaults to ~600 calendar days because the longest feature needs 252
+    *trading* sessions, and weekends/holidays mean that requires roughly 350+ calendar days;
+    600 leaves headroom for the warm-up plus gaps.
+
+    Returns (prices, benchmark, missing_tickers). Tickers that return nothing are reported
+    rather than silently dropped -- a missing name usually means a typo or a delisting, and
+    both are worth knowing about.
+    """
+    from quant_platform.data.adapters.open_data import YFinancePriceSource
+
+    end = end or date.today()
+    start = end - timedelta(days=lookback_days)
+
+    wanted = list(dict.fromkeys([*tickers, BENCHMARK_TICKER]))  # de-dupe, keep order
+    source = YFinancePriceSource()
+    raw = source.load_prices(wanted, start=start, end=end)
+
+    returned = set(raw["security_id"].unique().to_list())
+    missing = [t for t in wanted if t not in returned]
+    if missing:
+        logger.warning("no data returned for: %s", ", ".join(missing))
+
+    benchmark = raw.filter(pl.col("security_id") == BENCHMARK_TICKER).sort("observation_date")
+    if benchmark.is_empty():
+        raise RuntimeError(
+            f"benchmark {BENCHMARK_TICKER} returned no data; cannot compute beta or "
+            f"benchmark-relative features"
+        )
+    benchmark = benchmark.with_columns(
+        (pl.col("adjusted_close") / pl.col("adjusted_close").shift(1) - 1.0).alias(
+            "benchmark_return"
+        )
+    )
+
+    prices = raw.filter(pl.col("security_id") != BENCHMARK_TICKER)
+    return prices, benchmark, missing
+
+
+def build_peer_features(prices: pl.DataFrame, benchmark: pl.DataFrame) -> pl.DataFrame:
+    """Compute the price-derived feature panel for the peer universe."""
+    if "shares_outstanding" not in prices.columns:
+        # turnover needs a share count; without it that single feature is null rather than
+        # silently wrong.
+        prices = prices.with_columns(pl.lit(None, dtype=pl.Float64).alias("shares_outstanding"))
+    return compute_price_features(prices, benchmark)
+
+
+def _percentile_of(values: np.ndarray, target: float, higher_is_better: bool) -> float:
+    """Percentile rank of ``target`` within ``values`` (0-100)."""
+    finite = values[np.isfinite(values)]
+    if finite.size < 2 or not np.isfinite(target):
+        return float("nan")
+    below = float((finite < target).sum())
+    pct = below / finite.size * 100.0
+    return pct if higher_is_better else 100.0 - pct
+
+
+def build_scorecard(
+    ticker: str,
+    features: pl.DataFrame,
+    prices: pl.DataFrame,
+    as_of: date | None = None,
+    min_peers: int = 20,
+) -> Scorecard:
+    """Rank one ticker against the peer cross-section on the latest available date."""
+    ticker = ticker.upper()
+
+    # Use the last date where this ticker actually has features, then take that whole
+    # cross-section. Using the panel's global max date would compare the stock against peers
+    # on a day it may not have traded.
+    ticker_rows = features.filter(pl.col("security_id") == ticker).drop_nulls("momentum_252d")
+    if ticker_rows.is_empty():
+        raise ValueError(
+            f"{ticker} has no computable features. It may be missing from the download, or "
+            f"have less than ~1 year of price history (the longest factor needs 252 sessions)."
+        )
+
+    target_date = as_of or as_date(ticker_rows["as_of"].max(), f"{ticker} latest feature date")
+    cross_section = features.filter(pl.col("as_of") == target_date)
+    if cross_section.height < min_peers:
+        raise ValueError(
+            f"only {cross_section.height} peers have features on {target_date}; need at least "
+            f"{min_peers} for a percentile to be meaningful"
+        )
+
+    row = cross_section.filter(pl.col("security_id") == ticker)
+    if row.is_empty():
+        raise ValueError(f"{ticker} has no features on {target_date}")
+
+    price_row = prices.filter(
+        (pl.col("security_id") == ticker) & (pl.col("observation_date") <= target_date)
+    ).sort("observation_date")
+    last_price = float(price_row["close"][-1]) if not price_row.is_empty() else float("nan")
+
+    card = Scorecard(
+        ticker=ticker,
+        as_of=target_date,
+        price=last_price,
+        peer_count=cross_section.height - 1,  # exclude the stock itself
+        unavailable_pillars=dict(UNAVAILABLE_PILLARS),
+    )
+
+    family_scores: dict[str, list[float]] = {}
+    for family, definitions in _SCORECARD_FACTORS.items():
+        scores: list[FactorScore] = []
+        for column, sign, description in definitions:
+            if column not in cross_section.columns:
+                continue
+            peers = cross_section[column].to_numpy().astype(float)
+            value = float(row[column][0]) if row[column][0] is not None else float("nan")
+            if not np.isfinite(value):
+                continue
+            pct = _percentile_of(peers, value, higher_is_better=sign > 0)
+            if not np.isfinite(pct):
+                continue
+            finite_peers = peers[np.isfinite(peers)]
+            scores.append(
+                FactorScore(
+                    name=column,
+                    description=description,
+                    raw_value=value,
+                    percentile=pct,
+                    peer_median=float(np.median(finite_peers))
+                    if finite_peers.size
+                    else float("nan"),
+                )
+            )
+        if scores:
+            card.factors[family] = scores
+            family_scores[family] = [s.percentile for s in scores]
+            card.family_percentiles[family] = float(np.mean([s.percentile for s in scores]))
+
+    if not card.family_percentiles:
+        raise ValueError(f"no factors could be evaluated for {ticker} on {target_date}")
+
+    # Composite: average the family percentiles this data can actually support, then rank the
+    # whole cross-section the same way so the stock's standing is comparable.
+    composite_by_security = _composite_across_cross_section(cross_section)
+    if ticker in composite_by_security:
+        own = composite_by_security[ticker]
+        all_values = np.array(list(composite_by_security.values()))
+        card.composite_percentile = _percentile_of(all_values, own, higher_is_better=True)
+        ordering = sorted(composite_by_security.items(), key=lambda kv: kv[1], reverse=True)
+        card.composite_rank = [t for t, _ in ordering].index(ticker) + 1
+
+    card.warnings = [
+        "Peer universe is survivorship-biased: it contains only currently-listed companies.",
+        "Value and quality pillars are NOT evaluated (no point-in-time fundamentals via this "
+        "data source), so the composite reflects momentum, reversal, defensive, and liquidity "
+        "characteristics only.",
+        "Percentiles describe what the stock looks like today. They are not a forecast and "
+        "not a recommendation.",
+    ]
+    return card
+
+
+def _composite_across_cross_section(cross_section: pl.DataFrame) -> dict[str, float]:
+    """Composite score for every security in the cross-section.
+
+    Computed by ranking each factor within the cross-section, applying its sign, and
+    averaging by family then across families. Equal family weighting is used because the
+    weights in the research charter assume value and quality are present; silently reusing
+    them here would over-weight whatever remains.
+    """
+    scores: dict[str, list[float]] = {}
+    n = cross_section.height
+    ids = cross_section["security_id"].to_list()
+
+    for _family, definitions in _SCORECARD_FACTORS.items():
+        family_matrix: list[np.ndarray] = []
+        for column, sign, _ in definitions:
+            if column not in cross_section.columns:
+                continue
+            values = cross_section[column].to_numpy().astype(float)
+            if not np.isfinite(values).any():
+                continue
+            order = values * sign
+            ranks = np.full(n, np.nan)
+            finite = np.isfinite(order)
+            if finite.sum() < 2:
+                continue
+            # Percentile rank within the finite subset.
+            sub = order[finite]
+            sub_ranks = sub.argsort().argsort().astype(float) / max(sub.size - 1, 1)
+            ranks[finite] = sub_ranks
+            family_matrix.append(ranks)
+        if family_matrix:
+            stacked = np.vstack(family_matrix)
+            with np.errstate(invalid="ignore"):
+                family_mean = np.nanmean(stacked, axis=0)
+            scores.setdefault("_families", [])
+            for i, sec in enumerate(ids):
+                scores.setdefault(sec, []).append(float(family_mean[i]))
+
+    scores.pop("_families", None)
+    out: dict[str, float] = {}
+    for sec, family_values in scores.items():
+        finite_values = [v for v in family_values if np.isfinite(v)]
+        if finite_values:
+            out[sec] = float(np.mean(finite_values))
+    return out
+
+
+def analyze_tickers(
+    tickers: list[str],
+    peers: list[str] | None = None,
+    lookback_days: int = 600,
+    end: date | None = None,
+) -> tuple[list[Scorecard], list[str]]:
+    """Fetch data and build scorecards for one or more tickers.
+
+    The requested tickers are added to the peer universe automatically, so a stock outside
+    the default list can still be ranked.
+    """
+    tickers = [t.upper() for t in tickers]
+    universe = list(dict.fromkeys([*(peers or DEFAULT_PEER_UNIVERSE), *tickers]))
+
+    logger.info("downloading %d tickers (%d peers + benchmark)", len(universe), len(universe))
+    prices, benchmark, missing = fetch_universe_prices(universe, lookback_days, end)
+
+    logger.info("computing features for %d securities", prices["security_id"].n_unique())
+    features = build_peer_features(prices, benchmark)
+
+    cards: list[Scorecard] = []
+    failures: list[str] = []
+
+    # A requested ticker that returned no data is a real problem for the user (typo, or the
+    # company is delisted and yfinance cannot serve it). Report it rather than letting it
+    # vanish into a generic "could not score" later.
+    for ticker in tickers:
+        if ticker in missing:
+            failures.append(
+                f"{ticker}: no data returned. Check the symbol; note that delisted companies "
+                f"cannot be retrieved from this source."
+            )
+
+    for ticker in [t for t in tickers if t not in missing]:
+        try:
+            cards.append(build_scorecard(ticker, features, prices))
+        except ValueError as exc:
+            logger.warning("could not score %s: %s", ticker, exc)
+            failures.append(f"{ticker}: {exc}")
+    return cards, failures
+
+
+def format_scorecard(card: Scorecard) -> str:
+    """Render a scorecard as readable text."""
+    lines: list[str] = []
+    lines.append("=" * 74)
+    lines.append(f"  {card.ticker}  --  factor scorecard as of {card.as_of}")
+    lines.append(f"  last close ${card.price:,.2f}   |   ranked against {card.peer_count} peers")
+    lines.append("=" * 74)
+
+    if np.isfinite(card.composite_percentile):
+        lines.append("")
+        lines.append(
+            f"  COMPOSITE STANDING: {card.composite_percentile:.0f}th percentile "
+            f"(#{card.composite_rank} of {card.peer_count + 1})"
+        )
+        lines.append(
+            "  Descriptive only -- this summarizes the factor characteristics the stock "
+            "exhibits\n  today. It is not a forecast and not a recommendation."
+        )
+
+    for family, scores in card.factors.items():
+        family_pct = card.family_percentiles.get(family, float("nan"))
+        lines.append("")
+        lines.append(f"  {family.upper()}  ({family_pct:.0f}th percentile overall)")
+        lines.append("  " + "-" * 70)
+        for score in scores:
+            bar_len = round(score.percentile / 5)
+            bar = "#" * bar_len + "." * (20 - bar_len)
+            lines.append(
+                f"    {score.description:<44s} {bar} {score.percentile:5.0f}%  ({score.label})"
+            )
+            lines.append(
+                f"      {'raw: ' + f'{score.raw_value:+.4f}':<20s} peer median: "
+                f"{score.peer_median:+.4f}"
+            )
+
+    if card.unavailable_pillars:
+        lines.append("")
+        lines.append("  NOT EVALUATED")
+        lines.append("  " + "-" * 70)
+        for pillar, reason in card.unavailable_pillars.items():
+            lines.append(f"    {pillar:<12s} {reason}")
+
+    lines.append("")
+    lines.append("  CAVEATS")
+    lines.append("  " + "-" * 70)
+    for warning in card.warnings:
+        lines.append(f"    - {warning}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def compare_scorecards(cards: list[Scorecard]) -> pl.DataFrame:
+    """Side-by-side comparison of several scorecards."""
+    if not cards:
+        return pl.DataFrame()
+    families = sorted({f for c in cards for f in c.family_percentiles})
+    return pl.DataFrame(
+        [
+            {
+                "ticker": c.ticker,
+                "price": c.price,
+                "composite_pct": c.composite_percentile,
+                "rank": c.composite_rank,
+                **{f: c.family_percentiles.get(f, float("nan")) for f in families},
+            }
+            for c in cards
+        ]
+    ).sort("composite_pct", descending=True, nulls_last=True)

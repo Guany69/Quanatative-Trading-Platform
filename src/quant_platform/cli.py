@@ -724,6 +724,92 @@ def list_models() -> None:
         print(f"    {name:20s}{suffix}")
 
 
+@app.command("analyze")
+def analyze(
+    tickers: Annotated[str, typer.Argument(help="Ticker(s), comma-separated. e.g. AAPL,MSFT")],
+    peers: Annotated[
+        str | None,
+        typer.Option("--peers", help="Comma-separated peer tickers, or a file with one per line."),
+    ] = None,
+    lookback_days: Annotated[int, typer.Option("--lookback-days")] = 600,
+    out: Annotated[Path | None, typer.Option("--out", "-o", help="Write JSON here.")] = None,
+) -> None:
+    """Factor scorecard for real stocks, ranked against a peer universe.
+
+    Downloads real prices and reports where each stock sits relative to its peers on
+    momentum, reversal, defensive, and liquidity factors.
+
+    Requires network access. Results are DESCRIPTIVE, not a forecast or recommendation.
+    """
+    configure_logging("INFO")
+    import json
+
+    from quant_platform.analysis import (
+        DEFAULT_PEER_UNIVERSE,
+        analyze_tickers,
+        compare_scorecards,
+        format_scorecard,
+    )
+
+    requested = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    if not requested:
+        _echo("No tickers supplied.", "err")
+        raise typer.Exit(1)
+
+    peer_list: list[str] | None = None
+    if peers:
+        peer_path = Path(peers)
+        if peer_path.exists():
+            peer_list = [
+                line.strip().upper()
+                for line in peer_path.read_text().splitlines()
+                if line.strip() and not line.startswith("#")
+            ]
+            _echo(f"using {len(peer_list)} peers from {peer_path}", "info")
+        else:
+            peer_list = [t.strip().upper() for t in peers.split(",") if t.strip()]
+
+    _echo(
+        f"Analyzing {', '.join(requested)} against "
+        f"{len(peer_list) if peer_list else len(DEFAULT_PEER_UNIVERSE)} peers...",
+        "info",
+    )
+
+    try:
+        cards, failures = analyze_tickers(requested, peer_list, lookback_days)
+    except Exception as exc:
+        logger.exception("analysis failed")
+        _echo(f"Analysis failed: {exc}", "err")
+        _echo("This command needs network access to download prices.", "warn")
+        raise typer.Exit(1) from exc
+
+    for failure in failures:
+        _echo(f"  could not score {failure}", "warn")
+    if not cards:
+        _echo("No tickers could be scored.", "err")
+        raise typer.Exit(1)
+
+    for card in cards:
+        print(format_scorecard(card))
+
+    if len(cards) > 1:
+        _echo("COMPARISON (percentiles vs peers)", "ok")
+        with __import__("polars").Config(tbl_rows=50, tbl_width_chars=160):
+            print(compare_scorecards(cards))
+
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w") as fh:
+            json.dump([c.to_dict() for c in cards], fh, indent=2, default=str)
+        _echo(f"\nJSON written to {out}", "ok")
+
+    _echo(
+        "\nDescriptive factor standings only. NOT investment advice, NOT a forecast, and "
+        "NOT a recommendation to buy or sell anything.",
+        "warn",
+    )
+
+
 def main() -> None:  # pragma: no cover
     app()
 
