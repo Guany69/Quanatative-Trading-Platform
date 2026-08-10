@@ -810,6 +810,28 @@ def analyze(
     )
 
 
+@app.command("serve")
+def serve_cmd(
+    port: Annotated[int, typer.Option("--port", "-p")] = 8000,
+    no_browser: Annotated[bool, typer.Option("--no-browser")] = False,
+) -> None:
+    """Serve the factor scorecard as a local web UI.
+
+    Binds to 127.0.0.1 only -- the interface has no authentication and is not intended to be
+    reachable from anywhere but this machine.
+    """
+    configure_logging("INFO")
+    from quant_platform.web import HOST, serve
+
+    _echo(f"Starting local server at http://{HOST}:{port}", "ok")
+    _echo("Loopback only. Press Ctrl+C to stop.", "info")
+    try:
+        serve(port=port, open_browser=not no_browser)
+    except RuntimeError as exc:
+        _echo(str(exc), "err")
+        raise typer.Exit(1) from exc
+
+
 def main() -> None:  # pragma: no cover
     app()
 

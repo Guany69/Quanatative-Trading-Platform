@@ -29,8 +29,10 @@ Known gaps in this path, stated plainly:
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -317,6 +319,82 @@ def fetch_universe_prices(
     return prices, benchmark, missing
 
 
+# --------------------------------------------------------------------------- price cache
+CACHE_DIR = Path("data/interim/price_cache")
+
+
+def _cache_path(tickers: list[str], lookback_days: int, end: date) -> Path:
+    """Cache key covering everything that changes the downloaded content."""
+    digest = hashlib.sha256(
+        f"{sorted(tickers)}|{lookback_days}|{end.isoformat()}".encode()
+    ).hexdigest()[:16]
+    return CACHE_DIR / f"{end.isoformat()}_{digest}.parquet"
+
+
+def _with_benchmark_return(benchmark: pl.DataFrame) -> pl.DataFrame:
+    """Attach the benchmark return series.
+
+    Computed in exactly one place so the cached and freshly-downloaded paths cannot diverge:
+    the cache stores raw price columns only, and this derived column is added on the way out
+    of both branches.
+    """
+    return benchmark.sort("observation_date").with_columns(
+        (pl.col("adjusted_close") / pl.col("adjusted_close").shift(1) - 1.0).alias(
+            "benchmark_return"
+        )
+    )
+
+
+def fetch_universe_prices_cached(
+    tickers: list[str],
+    lookback_days: int = 600,
+    end: date | None = None,
+    use_cache: bool = True,
+) -> tuple[pl.DataFrame, pl.DataFrame, list[str]]:
+    """Cached wrapper around :func:`fetch_universe_prices`.
+
+    Downloading ~110 tickers takes 30-60 seconds, which is fine for a one-off CLI call and
+    unusable for a web UI where every page load would repeat it. The cache is keyed on the
+    ticker set, lookback, and end date, so a different request still fetches fresh data.
+
+    Entries are keyed by end date, so a new trading day naturally produces a new file rather
+    than serving stale prices. Older files are pruned.
+    """
+    end = end or date.today()
+    if not use_cache:
+        prices, benchmark, missing = fetch_universe_prices(tickers, lookback_days, end)
+        return prices, benchmark, missing
+
+    path = _cache_path(tickers, lookback_days, end)
+    if path.exists():
+        try:
+            cached = pl.read_parquet(path)
+            prices = cached.filter(pl.col("security_id") != BENCHMARK_TICKER)
+            benchmark = cached.filter(pl.col("security_id") == BENCHMARK_TICKER)
+            if not prices.is_empty() and not benchmark.is_empty():
+                returned = set(cached["security_id"].unique().to_list())
+                missing = [t for t in tickers if t not in returned]
+                logger.info("using cached prices (%s)", path.name)
+                return prices, _with_benchmark_return(benchmark), missing
+        except Exception as exc:  # a corrupt cache must never block a real request
+            logger.warning("ignoring unreadable cache %s: %s", path, exc)
+
+    prices, benchmark, missing = fetch_universe_prices(tickers, lookback_days, end)
+
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        # Store raw columns only; derived series are recomputed on read.
+        raw_benchmark = benchmark.drop("benchmark_return", strict=False)
+        pl.concat([prices, raw_benchmark], how="diagonal").write_parquet(path)
+        for old in CACHE_DIR.glob("*.parquet"):
+            if not old.name.startswith(end.isoformat()):
+                old.unlink(missing_ok=True)
+    except Exception as exc:
+        logger.warning("could not write price cache: %s", exc)
+
+    return prices, benchmark, missing
+
+
 def build_peer_features(prices: pl.DataFrame, benchmark: pl.DataFrame) -> pl.DataFrame:
     """Compute the price-derived feature panel for the peer universe."""
     if "shares_outstanding" not in prices.columns:
@@ -487,6 +565,7 @@ def analyze_tickers(
     peers: list[str] | None = None,
     lookback_days: int = 600,
     end: date | None = None,
+    use_cache: bool = True,
 ) -> tuple[list[Scorecard], list[str]]:
     """Fetch data and build scorecards for one or more tickers.
 
@@ -497,7 +576,9 @@ def analyze_tickers(
     universe = list(dict.fromkeys([*(peers or DEFAULT_PEER_UNIVERSE), *tickers]))
 
     logger.info("downloading %d tickers (%d peers + benchmark)", len(universe), len(universe))
-    prices, benchmark, missing = fetch_universe_prices(universe, lookback_days, end)
+    prices, benchmark, missing = fetch_universe_prices_cached(
+        universe, lookback_days, end, use_cache=use_cache
+    )
 
     logger.info("computing features for %d securities", prices["security_id"].n_unique())
     features = build_peer_features(prices, benchmark)
