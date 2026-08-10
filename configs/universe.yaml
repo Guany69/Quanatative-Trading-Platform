@@ -1,0 +1,12 @@
+# Investable universe eligibility rules (spec section 4.1).
+name: sp500
+allowed_security_types: [common_stock]   # ETFs/preferred/warrants/rights excluded
+min_price: 5.0                           # applied to the UNADJUSTED close
+min_dollar_volume: 5000000.0
+dollar_volume_lookback_sessions: 21
+min_history_sessions: 252
+max_securities: null
+# Never silently treat current membership as historical membership. If a provider cannot
+# supply true historical constituents, enabling this marks all results survivorship-biased.
+allow_survivorship_biased_fallback: false
+exclude_sectors: []

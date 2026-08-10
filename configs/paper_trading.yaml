@@ -1,0 +1,6 @@
+# Paper trading (spec section 26). Broker-neutral and fully simulated by default.
+# Orders remain proposals until a human approves them.
+require_manual_confirmation: true
+broker: simulated
+state_dir: paper_state
+initial_capital: 1000000.0

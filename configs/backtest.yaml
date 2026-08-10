@@ -1,0 +1,10 @@
+# Backtest engine settings (spec section 21).
+initial_capital: 10000000.0
+rebalance:
+  frequency: weekly
+  signal_day: week_end
+  # >= 1 enforced by config validation: you cannot fill at the close that made the signal.
+  execution_delay_sessions: 1
+cost_scenario: base
+reinvest_dividends: true
+allow_partial_fills: true

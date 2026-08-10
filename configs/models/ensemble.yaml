@@ -1,0 +1,9 @@
+# Constrained rank ensemble (spec section 14.7). Combines cross-sectional RANKS, not raw
+# predictions, so differing output scales cannot let one model dominate.
+model: ensemble
+members: [elastic_net, lightgbm, neural_network]
+max_weight: 0.5      # no single model may take over after a lucky stretch
+min_weight: 0.1      # preserves the diversity that justifies ensembling
+smoothing: 0.7       # slow updates; fast reweighting is performance-chasing
+# Weights are fitted on VALIDATION results only. Using the locked holdout would make the
+# final estimate self-selected (spec section 16.3).

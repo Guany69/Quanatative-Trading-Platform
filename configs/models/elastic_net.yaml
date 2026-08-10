@@ -1,0 +1,6 @@
+# Regularized linear model (spec section 14.3). L2 shares weight among collinear features
+# (equity features are heavily correlated); L1 zeroes the useless ones.
+model: elastic_net
+alpha: 0.001
+l1_ratio: 0.5
+max_iter: 5000

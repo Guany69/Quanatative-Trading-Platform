@@ -1,0 +1,26 @@
+# Transaction cost model (spec section 18). All components are estimates; see
+# docs/limitations.md -- the impact model in particular is not a universal law.
+commission:
+  model: basis_points
+  basis_points: 1.0
+  per_share: 0.005
+  per_order: 1.0
+  minimum: 0.0
+spread:
+  model: fixed_bps
+  fixed_bps: 5.0
+  stress_multiplier: 1.0
+slippage:
+  model: volatility_scaled
+  fixed_bps: 2.0
+  volatility_coefficient: 0.1
+  participation_coefficient: 0.1
+impact:
+  model: square_root
+  coefficient: 0.1
+  exponent: 0.5
+scenario_multipliers:
+  zero: 0.0      # diagnostic only -- never an achievable result
+  base: 1.0
+  double: 2.0
+  triple: 3.0

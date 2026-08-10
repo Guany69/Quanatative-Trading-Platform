@@ -1,0 +1,3 @@
+# Equal weight across top-ranked names. Hard to beat: it estimates nothing, so it carries no
+# estimation error.
+constructor: equal_weight

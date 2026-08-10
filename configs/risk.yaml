@@ -1,0 +1,8 @@
+# Risk model (spec section 19). Shrinkage is the default because sample covariance on
+# ~500 names with ~252 observations is badly conditioned and produces unstable optimizer output.
+covariance_method: ledoit_wolf
+covariance_lookback_sessions: 252
+shrinkage_intensity: null   # null => estimated from data
+beta_lookback_sessions: 252
+min_observations: 60
+risk_aversion: 5.0

@@ -1,0 +1,11 @@
+# Walk-forward validation and leakage controls (spec section 16).
+min_train_years: 3.0
+validation_months: 12
+test_months: 12
+step_months: 12
+# Must be >= label.forecast_horizon_sessions, else label windows straddle the boundary.
+embargo_sessions: 20
+purge_enabled: true
+holdout: null
+# Enabling this burns the holdout's statistical value. It can honestly be looked at once.
+allow_holdout_evaluation: false

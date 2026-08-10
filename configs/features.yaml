@@ -1,0 +1,7 @@
+# Feature engineering (spec section 12). Preprocessing is fit on the training window only.
+enabled_families: [momentum, reversal, risk, liquidity, value, quality]
+winsorize_quantile: 0.01
+neutralize_sector: false
+neutralize_size: false
+min_cross_section: 10
+feature_version: 1.0.0

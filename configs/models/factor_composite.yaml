@@ -1,0 +1,10 @@
+# Transparent factor composite (spec section 14.2). Not fitted to the target: its weights are
+# economic priors, which makes it genuinely out-of-sample at every date and immune to the
+# backtest overfitting that afflicts trained models. This is the bar ML models must clear.
+model: factor_composite
+weights:
+  momentum: 0.30
+  value: 0.20
+  quality: 0.25
+  defensive: 0.15
+  liquidity: 0.10

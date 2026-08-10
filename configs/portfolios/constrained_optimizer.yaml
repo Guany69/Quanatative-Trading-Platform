@@ -1,0 +1,8 @@
+# Constrained mean-variance optimization (spec section 20).
+constructor: constrained_optimizer
+risk_aversion: 5.0
+cost_penalty: 1.0
+tracking_penalty: 0.0
+solver: null          # null => CLARABEL
+# Constraints come from portfolio.* in the research charter. If infeasible, the ordered
+# relaxation policy applies and every relaxation is logged -- never silently dropped.

@@ -1,0 +1,10 @@
+# Provider selection. 'fixture' is the deterministic synthetic provider used by run-demo;
+# it needs no network access and no credentials.
+prices: fixture
+fundamentals: fixture
+macro: fixture
+constituents: fixture
+corporate_actions: fixture
+cache_dir: data/interim
+raw_dir: data/raw
+processed_dir: data/processed

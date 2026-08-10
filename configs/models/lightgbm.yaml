@@ -1,0 +1,19 @@
+# Primary nonlinear model (spec section 14.4). Deliberately low-capacity: cross-sectional
+# return prediction has R^2 near zero, so library defaults would fit noise perfectly.
+model: lightgbm
+num_leaves: 15
+max_depth: 4
+learning_rate: 0.03
+n_estimators: 300
+min_child_samples: 100
+subsample: 0.7
+colsample_bytree: 0.6
+reg_alpha: 0.5
+reg_lambda: 10.0
+early_stopping_rounds: 50
+# Bounded search only. An unrestricted sweep is itself a multiple-testing problem that
+# manufactures apparent skill; n_trials feeds the Deflated Sharpe correction.
+tuning:
+  enabled: false
+  n_trials: 20
+  timeout_seconds: 300
