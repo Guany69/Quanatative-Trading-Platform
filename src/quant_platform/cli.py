@@ -14,7 +14,10 @@ from typing import Annotated
 import typer
 
 from quant_platform.utilities.narrow import as_date, as_float
-from quant_platform.utilities.reproducibility import configure_logging, get_logger
+from quant_platform.utilities.reproducibility import configure_logging, get_logger, load_dotenv
+
+# Load .env before any command runs, so credentials are available without shell sourcing.
+load_dotenv()
 
 app = typer.Typer(
     name="quant-platform",

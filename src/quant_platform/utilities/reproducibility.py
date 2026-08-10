@@ -21,6 +21,33 @@ import numpy as np
 LOGGER_NAME = "quant_platform"
 
 
+def load_dotenv(path: str | Path = ".env") -> dict[str, str]:
+    """Load KEY=VALUE pairs from a .env file into the environment.
+
+    Deliberately minimal (no python-dotenv dependency) and deliberately non-overriding: a
+    variable already set in the real environment wins, so an explicit `export` is never
+    silently overwritten by a stale file.
+
+    Values may be quoted, which lets the same file be `source`d from a shell -- unquoted
+    values containing spaces would otherwise be parsed as commands.
+    """
+    p = Path(path)
+    loaded: dict[str, str] = {}
+    if not p.exists():
+        return loaded
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+            loaded[key] = value
+    return loaded
+
+
 def set_global_seeds(seed: int) -> dict[str, Any]:
     """Seed every RNG the platform can reach.
 

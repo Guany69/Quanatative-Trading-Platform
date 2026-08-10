@@ -193,6 +193,19 @@ _SCORECARD_FACTORS: dict[str, list[tuple[str, float, str]]] = {
         ("max_drawdown_252d", 1.0, "1-year max drawdown (shallower is better)"),
         ("downside_vol_60d", -1.0, "downside volatility"),
     ],
+    "value": [
+        ("earnings_yield", 1.0, "earnings yield (profit per dollar of price)"),
+        ("book_to_market", 1.0, "book-to-market (net assets per dollar of price)"),
+        ("sales_to_price", 1.0, "sales-to-price (revenue per dollar of price)"),
+        ("fcf_yield", 1.0, "free-cash-flow yield"),
+    ],
+    "quality": [
+        ("gross_profitability", 1.0, "gross profit / assets (Novy-Marx profitability)"),
+        ("return_on_equity", 1.0, "return on equity"),
+        ("return_on_assets", 1.0, "return on assets"),
+        ("operating_margin", 1.0, "operating margin"),
+        ("debt_to_assets", -1.0, "debt / assets (less leverage scores higher)"),
+    ],
     "liquidity": [
         ("adv_21d", 1.0, "average daily dollar volume"),
         ("amihud_illiquidity_21d", -1.0, "Amihud illiquidity (lower is more liquid)"),
@@ -269,6 +282,17 @@ FAMILY_EXPLANATIONS: dict[str, str] = {
         "A HIGH score means it moves less than peers. The low-volatility anomaly is the "
         "observation that calmer stocks have historically delivered better risk-adjusted "
         "returns than their raw returns suggest -- not that they return more."
+    ),
+    "value": (
+        "How much profit, book value, sales, and cash flow you get per dollar of share price. "
+        "A HIGH score means the stock is cheap on these ratios relative to peers. Cheapness is "
+        "not the same as good: a stock can be cheap because the business is deteriorating."
+    ),
+    "quality": (
+        "How profitable and financially sound the business is -- margins, returns on capital, "
+        "and leverage. A HIGH score means more profitable and less indebted than peers. "
+        "Computed from SEC filings using the actual filing date, so no figure appears before "
+        "it was published."
     ),
     "liquidity": (
         "How easily the stock can be traded without moving its own price. Matters because a "
@@ -374,6 +398,71 @@ FACTOR_GLOSSARY: dict[str, FactorExplanation] = {
         "has smaller downside swings than its peers",
         "has larger downside swings than its peers",
         lambda v: f"{_pct(v)} annualized downside volatility",
+    ),
+    "earnings_yield": FactorExplanation(
+        "Trailing-twelve-month net income divided by market capitalization. The inverse of "
+        "the P/E ratio: how much profit you get per dollar invested.",
+        "generates more profit per dollar of share price than peers (cheaper on earnings)",
+        "generates less profit per dollar of price (expensive on earnings, or unprofitable)",
+        lambda v: (
+            f"{_pct(v)} earnings yield"
+            + (f" (about {1 / v:.1f}x P/E)" if v > 0.001 else " (loss-making or barely profitable)")
+        ),
+    ),
+    "book_to_market": FactorExplanation(
+        "Shareholders' equity divided by market capitalization. Above 1.0 means the market "
+        "values the company below its accounting net worth.",
+        "trades cheaply relative to its balance-sheet net worth",
+        "trades at a large premium to its book value",
+        lambda v: (
+            f"book/market {v:.2f}"
+            + (" -- priced below accounting net worth" if v > 1 else " -- priced above book value")
+        ),
+    ),
+    "sales_to_price": FactorExplanation(
+        "Trailing-twelve-month revenue divided by market capitalization.",
+        "carries more revenue per dollar of share price than peers",
+        "carries little revenue per dollar of price",
+        lambda v: f"{v:.2f}x revenue per dollar of market value",
+    ),
+    "fcf_yield": FactorExplanation(
+        "Operating cash flow minus capital expenditure, divided by market cap. Cash the "
+        "business actually generates, per dollar of price -- harder to manipulate than earnings.",
+        "throws off more free cash per dollar of price than peers",
+        "generates little or negative free cash relative to its price",
+        lambda v: f"{_pct(v)} free-cash-flow yield",
+    ),
+    "gross_profitability": FactorExplanation(
+        "Gross profit divided by total assets. Novy-Marx's measure of how productively a "
+        "company uses its asset base.",
+        "converts its assets into gross profit more efficiently than peers",
+        "generates little gross profit per dollar of assets",
+        lambda v: f"{_pct(v)} gross profit per dollar of assets",
+    ),
+    "return_on_equity": FactorExplanation(
+        "Trailing-twelve-month net income divided by shareholders' equity.",
+        "earns a higher return on shareholder capital than peers",
+        "earns a low or negative return on shareholder capital",
+        lambda v: f"{_pct(v)} return on equity",
+    ),
+    "return_on_assets": FactorExplanation(
+        "Trailing-twelve-month net income divided by total assets.",
+        "earns more profit per dollar of assets than peers",
+        "earns little profit per dollar of assets",
+        lambda v: f"{_pct(v)} return on assets",
+    ),
+    "operating_margin": FactorExplanation(
+        "Operating income divided by revenue -- how much of each sales dollar survives "
+        "operating costs.",
+        "keeps more of each sales dollar as operating profit than peers",
+        "operates on thinner margins than peers",
+        lambda v: f"{_pct(v)} operating margin",
+    ),
+    "debt_to_assets": FactorExplanation(
+        "Long-term debt divided by total assets. Scored so LESS leverage ranks higher.",
+        "carries less debt relative to its assets than peers",
+        "carries more debt relative to its assets than peers",
+        lambda v: f"debt is {_pct(v)} of total assets",
     ),
     "adv_21d": FactorExplanation(
         "Average daily dollar volume over 21 sessions (log scale). How much money changes "
@@ -591,6 +680,111 @@ def build_peer_features(prices: pl.DataFrame, benchmark: pl.DataFrame) -> pl.Dat
     return compute_price_features(prices, benchmark)
 
 
+def attach_fundamentals(
+    features: pl.DataFrame,
+    prices: pl.DataFrame,
+    tickers: list[str],
+    as_of: date | None = None,
+) -> tuple[pl.DataFrame, dict[str, str]]:
+    """Join SEC-derived value and quality ratios onto the feature panel.
+
+    Market capitalization is computed as (latest close x shares outstanding from the most
+    recent filing). That is an approximation: the share count is as of the last report, so a
+    large buyback or issuance since then is not reflected. It is nonetheless the honest
+    construction available from free data, and it is point-in-time correct in the sense that
+    no unpublished figure is used.
+
+    Returns the enriched panel plus a dict of pillars that remain unavailable (with reasons),
+    so the scorecard can keep reporting what it could not evaluate.
+    """
+    from quant_platform.data.sec_fundamentals import (
+        SecUnavailable,
+        compute_value_quality_features,
+        fetch_fundamentals_panel,
+    )
+
+    as_of = as_of or date.today()
+    unavailable: dict[str, str] = {}
+
+    try:
+        fundamentals = fetch_fundamentals_panel(tickers, as_of=as_of)
+    except SecUnavailable as exc:
+        logger.warning("SEC fundamentals unavailable: %s", exc)
+        return features, {
+            "value": f"SEC data unavailable ({exc})",
+            "quality": f"SEC data unavailable ({exc})",
+        }
+    except Exception as exc:
+        logger.warning("SEC fundamentals failed: %s", exc)
+        return features, {
+            "value": f"could not load SEC fundamentals ({type(exc).__name__})",
+            "quality": f"could not load SEC fundamentals ({type(exc).__name__})",
+        }
+
+    if fundamentals.is_empty():
+        return features, {
+            "value": "no SEC fundamentals returned for this universe",
+            "quality": "no SEC fundamentals returned for this universe",
+        }
+
+    latest_close = (
+        prices.sort("observation_date")
+        .group_by("security_id")
+        .agg(pl.col("close").last().alias("last_close"))
+    )
+    close_map = dict(zip(latest_close["security_id"], latest_close["last_close"], strict=True))
+
+    market_caps: dict[str, float] = {}
+    if "shares_outstanding" in fundamentals.columns:
+        for row in fundamentals.iter_rows(named=True):
+            shares = row.get("shares_outstanding")
+            close = close_map.get(row["security_id"])
+            if shares and close and shares > 0:
+                market_caps[row["security_id"]] = float(shares) * float(close)
+
+    if not market_caps:
+        return features, {
+            "value": "no share counts in SEC data, so market capitalization is unknown",
+            "quality": "no share counts in SEC data, so market capitalization is unknown",
+        }
+
+    enriched = compute_value_quality_features(fundamentals, market_caps)
+
+    ratio_columns = [
+        c
+        for c in (
+            "earnings_yield",
+            "book_to_market",
+            "sales_to_price",
+            "fcf_yield",
+            "gross_profitability",
+            "return_on_equity",
+            "return_on_assets",
+            "operating_margin",
+            "debt_to_assets",
+        )
+        if c in enriched.columns
+    ]
+    if not ratio_columns:
+        return features, {
+            "value": "SEC data lacked the concepts needed for these ratios",
+            "quality": "SEC data lacked the concepts needed for these ratios",
+        }
+
+    # Fundamentals are one row per security; broadcast across every feature date.
+    out = features.join(
+        enriched.select(["security_id", *ratio_columns]), on="security_id", how="left"
+    )
+
+    covered = enriched.select(ratio_columns).drop_nulls().height
+    logger.info(
+        "fundamentals joined: %d/%d securities have complete value/quality ratios",
+        covered,
+        len(tickers),
+    )
+    return out, unavailable
+
+
 def _percentile_of(values: np.ndarray, target: float, higher_is_better: bool) -> float:
     """Percentile rank of ``target`` within ``values`` (0-100)."""
     finite = values[np.isfinite(values)]
@@ -607,6 +801,7 @@ def build_scorecard(
     prices: pl.DataFrame,
     as_of: date | None = None,
     min_peers: int = 20,
+    unavailable_pillars: dict[str, str] | None = None,
 ) -> Scorecard:
     """Rank one ticker against the peer cross-section on the latest available date."""
     ticker = ticker.upper()
@@ -643,7 +838,9 @@ def build_scorecard(
         as_of=target_date,
         price=last_price,
         peer_count=cross_section.height - 1,  # exclude the stock itself
-        unavailable_pillars=dict(UNAVAILABLE_PILLARS),
+        unavailable_pillars=dict(
+            UNAVAILABLE_PILLARS if unavailable_pillars is None else unavailable_pillars
+        ),
     )
 
     family_scores: dict[str, list[float]] = {}
@@ -691,12 +888,23 @@ def build_scorecard(
 
     card.warnings = [
         "Peer universe is survivorship-biased: it contains only currently-listed companies.",
-        "Value and quality pillars are NOT evaluated (no point-in-time fundamentals via this "
-        "data source), so the composite reflects momentum, reversal, defensive, and liquidity "
-        "characteristics only.",
         "Percentiles describe what the stock looks like today. They are not a forecast and "
         "not a recommendation.",
     ]
+    if card.unavailable_pillars:
+        card.warnings.insert(
+            1,
+            f"These pillars were NOT evaluated: {', '.join(sorted(card.unavailable_pillars))}. "
+            f"The composite reflects only the families shown above.",
+        )
+    else:
+        card.warnings.insert(
+            1,
+            "Value and quality come from SEC filings using the actual filing date, so no "
+            "figure appears before it was published. Market capitalization uses the share "
+            "count from the most recent filing, so buybacks or issuance since then are not "
+            "reflected.",
+        )
     return card
 
 
@@ -753,6 +961,7 @@ def analyze_tickers(
     lookback_days: int = 600,
     end: date | None = None,
     use_cache: bool = True,
+    include_fundamentals: bool = True,
 ) -> tuple[list[Scorecard], list[str]]:
     """Fetch data and build scorecards for one or more tickers.
 
@@ -770,6 +979,11 @@ def analyze_tickers(
     logger.info("computing features for %d securities", prices["security_id"].n_unique())
     features = build_peer_features(prices, benchmark)
 
+    unavailable: dict[str, str] = dict(UNAVAILABLE_PILLARS)
+    if include_fundamentals:
+        logger.info("fetching SEC fundamentals (cached after the first run)")
+        features, unavailable = attach_fundamentals(features, prices, universe, end)
+
     cards: list[Scorecard] = []
     failures: list[str] = []
 
@@ -785,7 +999,7 @@ def analyze_tickers(
 
     for ticker in [t for t in tickers if t not in missing]:
         try:
-            cards.append(build_scorecard(ticker, features, prices))
+            cards.append(build_scorecard(ticker, features, prices, unavailable_pillars=unavailable))
         except ValueError as exc:
             logger.warning("could not score %s: %s", ticker, exc)
             failures.append(f"{ticker}: {exc}")

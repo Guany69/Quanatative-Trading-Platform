@@ -17,7 +17,7 @@ about markets, and the "strategy" has no investment meaning whatsoever.
 | Historical index constituents | **Not available.** No free source provides point-in-time S&P 500 membership. Requires a vendor file via `LocalConstituentSource`, or results are explicitly marked survivorship-biased. |
 | Survivorship bias | **Present with yfinance.** Only currently-listed tickers are queryable; bankrupt and acquired companies simply cannot be retrieved. |
 | Delisting returns | **Absent with free data.** A delisted security stops having bars; the terminal loss is never booked, which systematically overstates returns. |
-| Point-in-time fundamentals | **Partially available.** SEC EDGAR provides genuine filing dates (good), but XBRL tag coverage varies by filer, so the derived panel is incomplete. |
+| Point-in-time fundamentals | **Available and wired in.** SEC EDGAR companyfacts supplies genuine `filed` dates, so value and quality factors are computed without look-ahead. Caveats: XBRL tag coverage varies by filer (tag fallbacks are used); foreign issuers and ETFs have no CIK; market cap uses the share count from the latest filing, so buybacks since then are not reflected. |
 | Macro revision vintages | **Not available via standard FRED.** The API serves latest-revised values. Using them is a genuine look-ahead leak; ALFRED vintages would be required to fix this properly. |
 | Corporate actions | yfinance supplies adjusted prices, but the methodology is undocumented and occasionally revised. |
 | Ticker reuse | Not handled by free sources: a recycled symbol may splice two unrelated companies into one price history. |
@@ -34,6 +34,11 @@ fixture results must never be read as evidence about real markets.
 - **Benchmark sector weights** are approximated by equal-weighting the eligible universe,
   because true index constituent weights are not freely available.
 - **Beta = 1.0** is assumed when no benchmark history is available for a security.
+- **Trailing-twelve-month figures** prefer a sum of the four most recent quarters, falling
+  back to the latest annual report when quarterly coverage is incomplete. A TTM figure will
+  therefore often differ from the headline fiscal-year number, and is usually more current.
+- **Market capitalization** = latest close x shares outstanding from the most recent filing.
+  Share counts are stale between filings.
 - The **correlation regime feature** is a cheap proxy (dispersion ratio), not a true average
   pairwise correlation.
 
