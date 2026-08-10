@@ -254,6 +254,7 @@ def record_rebalance(
     model_version: str = "",
     feature_version: str = "",
     approved_by: str | None = None,
+    rebalance_id: str | None = None,
 ) -> RebalanceRecord:
     """Append a complete audit record of the cycle."""
     approved = [p for p in proposals if p.approved]
@@ -263,7 +264,7 @@ def record_rebalance(
         turnover = sum(f.gross_notional for f in fills) / total_value / 2.0
 
     record = RebalanceRecord(
-        rebalance_id=f"RB-{uuid.uuid4().hex[:8].upper()}",
+        rebalance_id=rebalance_id or f"RB-{uuid.uuid4().hex[:8].upper()}",
         signal_date=str(signal_date),
         order_date=str(order_date),
         created_at=datetime.now(UTC).isoformat(),

@@ -56,6 +56,13 @@ cache/
 .coverage
 htmlcov/
 
+# Frontend dependencies, builds, and test output
+frontend/node_modules/
+frontend/dist/
+frontend/playwright-report/
+frontend/test-results/
+frontend/*.tsbuildinfo
+
 # OS / editor
 .DS_Store
 .idea/

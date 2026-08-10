@@ -104,6 +104,7 @@ class PaperTradingState:
     positions: dict[str, PaperPosition] = field(default_factory=dict)
     rebalances: list[RebalanceRecord] = field(default_factory=list)
     pending_proposals: list[dict[str, Any]] = field(default_factory=list)
+    pending_rebalance: dict[str, Any] | None = None
     equity_history: list[dict[str, Any]] = field(default_factory=list)
     benchmark_history: list[dict[str, Any]] = field(default_factory=list)
     realized_pnl: float = 0.0
@@ -188,13 +189,16 @@ class PaperTradingState:
         if benchmark_value is not None:
             self.benchmark_history.append({"as_of": str(as_of), "benchmark_value": benchmark_value})
 
-    def stage_proposals(self, proposals: list[OrderProposal]) -> None:
+    def stage_proposals(
+        self, proposals: list[OrderProposal], *, context: dict[str, Any] | None = None
+    ) -> None:
         """Persist proposals awaiting approval.
 
         Written to disk before any human sees them, so an approval decision always refers to
         an immutable, recorded set of orders.
         """
         self.pending_proposals = [self._proposal_payload(proposal) for proposal in proposals]
+        self.pending_rebalance = dict(context) if context is not None else None
         self.proposal_history.extend(dict(row) for row in self.pending_proposals)
         self.updated_at = datetime.now(UTC).isoformat()
 
@@ -211,6 +215,7 @@ class PaperTradingState:
             "current_weight": proposal.current_weight,
             "reference_price": proposal.reference_price,
             "expected_cost": proposal.expected_cost.total,
+            "expected_cost_components": proposal.expected_cost.model_dump(mode="json"),
             "status": proposal.status.value,
             "approved": proposal.approved,
             "approved_at": proposal.approved_at.isoformat() if proposal.approved_at else None,
@@ -314,6 +319,7 @@ class PaperTradingState:
 
     def clear_proposals(self) -> None:
         self.pending_proposals = []
+        self.pending_rebalance = None
 
     # ------------------------------------------------------------------ persistence
     def save(self, path: str | Path) -> Path:
@@ -328,6 +334,7 @@ class PaperTradingState:
             "positions": {k: asdict(v) for k, v in self.positions.items()},
             "rebalances": [asdict(r) for r in self.rebalances],
             "pending_proposals": self.pending_proposals,
+            "pending_rebalance": self.pending_rebalance,
             "equity_history": self.equity_history,
             "benchmark_history": self.benchmark_history,
             "realized_pnl": self.realized_pnl,
@@ -368,6 +375,7 @@ class PaperTradingState:
         state.positions = {k: PaperPosition(**v) for k, v in (data.get("positions") or {}).items()}
         state.rebalances = [RebalanceRecord(**r) for r in (data.get("rebalances") or [])]
         state.pending_proposals = data.get("pending_proposals") or []
+        state.pending_rebalance = data.get("pending_rebalance")
         state.equity_history = data.get("equity_history") or []
         state.benchmark_history = data.get("benchmark_history") or []
         state.proposal_history = data.get("proposal_history") or []

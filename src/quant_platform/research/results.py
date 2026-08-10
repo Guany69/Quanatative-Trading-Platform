@@ -39,7 +39,10 @@ CREATE TABLE IF NOT EXISTS research_run (
     strategies_json JSON NOT NULL,
     scenarios_json JSON NOT NULL,
     fold_schedule_hash VARCHAR,
-    report_path VARCHAR
+    report_path VARCHAR,
+    current_stage VARCHAR,
+    updated_at TIMESTAMPTZ,
+    started_at TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS fold (
@@ -205,6 +208,18 @@ class ResultsStore:
         self._owner_pid = os.getpid()
         self._connection = duckdb.connect(str(self.path))
         self._connection.execute(_SCHEMA)
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """Add browser-observability fields without replacing existing databases."""
+        for definition in (
+            "current_stage VARCHAR",
+            "updated_at TIMESTAMPTZ",
+            "started_at TIMESTAMPTZ",
+        ):
+            self._connection.execute(
+                f"ALTER TABLE research_run ADD COLUMN IF NOT EXISTS {definition}"
+            )
 
     def close(self) -> None:
         self._connection.close()
@@ -233,9 +248,10 @@ class ResultsStore:
         if count:
             self._connection.execute(
                 """UPDATE research_run
-                   SET status='FAILED', completed_at=?, failure_stage='recovery', failure_cause=?
+                   SET status='FAILED', completed_at=?, updated_at=?,
+                       failure_stage='recovery', failure_cause=?
                    WHERE status='RUNNING'""",
-                [datetime.now(UTC), cause],
+                [datetime.now(UTC), datetime.now(UTC), cause],
             )
         return count
 
@@ -252,14 +268,21 @@ class ResultsStore:
         strategies: list[str],
         scenarios: list[str],
         fold_schedule_hash: str,
+        created_at: datetime | None = None,
     ) -> None:
         self._assert_owner()
+        now = datetime.now(UTC)
         self._connection.execute(
-            """INSERT INTO research_run VALUES
-               (?, ?, NULL, ?, ?, ?, ?, ?, 'RUNNING', NULL, NULL, ?, ?, ?, ?, NULL)""",
+            """INSERT INTO research_run (
+                   run_id, created_at, completed_at, snapshot_id, charter_hash,
+                   code_version, code_dirty, seed, status, failure_stage, failure_cause,
+                   models_json, strategies_json, scenarios_json, fold_schedule_hash,
+                   report_path, current_stage, updated_at, started_at
+               ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 'RUNNING', NULL, NULL, ?, ?, ?, ?,
+                         NULL, 'INITIALIZATION', ?, ?)""",
             [
                 run_id,
-                datetime.now(UTC),
+                created_at or now,
                 snapshot_id,
                 charter_hash,
                 code_version,
@@ -269,8 +292,21 @@ class ResultsStore:
                 json.dumps(strategies),
                 json.dumps(scenarios),
                 fold_schedule_hash,
+                now,
+                now,
             ],
         )
+
+    def update_stage(self, run_id: str, stage: str) -> None:
+        """Persist a real orchestrator stage for browser polling."""
+        self._assert_owner()
+        updated = self._connection.execute(
+            """UPDATE research_run SET current_stage=?, updated_at=?
+               WHERE run_id=? AND status='RUNNING' RETURNING run_id""",
+            [stage, datetime.now(UTC), run_id],
+        ).fetchone()
+        if updated is None:
+            raise ResultsStoreError(f"cannot update stage for unknown or terminal run {run_id}")
 
     def finish_run(
         self,
@@ -293,8 +329,16 @@ class ResultsStore:
             raise ResultsStoreError(f"run {run_id} is already terminal ({row[0]})")
         self._connection.execute(
             """UPDATE research_run SET status=?, completed_at=?, failure_stage=?,
-               failure_cause=?, report_path=? WHERE run_id=?""",
-            [status, datetime.now(UTC), failure_stage, failure_cause, report_path, run_id],
+               failure_cause=?, report_path=?, updated_at=? WHERE run_id=?""",
+            [
+                status,
+                datetime.now(UTC),
+                failure_stage,
+                failure_cause,
+                report_path,
+                datetime.now(UTC),
+                run_id,
+            ],
         )
 
     def write_folds(self, run_id: str, rows: pl.DataFrame) -> None:
@@ -546,7 +590,10 @@ class ResultsReader:
         self.path = Path(path)
         if not self.path.exists():
             raise ResultsStoreError(f"results database does not exist: {self.path}")
-        self._connection = duckdb.connect(str(self.path), read_only=True)
+        # DuckDB does not permit mixing read-only and read-write connections to the same
+        # database in one process.  API readers therefore use a normal connection but expose
+        # only read methods; ResultsStore remains the sole component that mutates the DB.
+        self._connection = duckdb.connect(str(self.path))
 
     def close(self) -> None:
         self._connection.close()
@@ -609,6 +656,17 @@ class ResultsReader:
         if result.is_empty():
             raise ResultsStoreError("results query selected no rows")
         return result
+
+    def fetch(self, sql: str, parameters: list[Any] | None = None) -> pl.DataFrame:
+        """Execute one internal, parameterized SELECT and allow an empty result.
+
+        This is intentionally an application-internal seam.  The HTTP adapter exposes only
+        purpose-specific query methods and never accepts SQL from a browser.
+        """
+        normalized = sql.strip().lower()
+        if not normalized.startswith("select") or ";" in normalized:
+            raise ResultsStoreError("result reads must be one read-only SELECT")
+        return self._connection.execute(sql, parameters or []).pl()
 
     def export_csv(self, frame: pl.DataFrame, path: str | Path) -> Path:
         target = Path(path)

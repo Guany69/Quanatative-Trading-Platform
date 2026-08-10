@@ -21,6 +21,12 @@ CLI -> PaperTradingCoordinator
   -> shared PIT feature path -> strategy -> recorded proposals
   -> HUMAN APPROVAL/REJECTION -> >=1-session delayed SimulatedBroker only
   -> fills + unfilled orders + reconciliation -> atomic forward-only PaperTradingState
+
+Browser -> React/TypeScript -> loopback FastAPI adapter
+  -> typed DTO validation -> application services (no quantitative logic)
+  -> durable FIFO ResearchRunJobManager -> ExperimentRunOrchestrator
+  -> purpose-specific ResultsReader queries -> bounded JSON pages
+  -> serialized PaperService -> PaperTradingCoordinator/domain approval gate
 ```
 
 ## The five timestamps
@@ -56,6 +62,9 @@ of fake alpha:
 | `execution/` + `paper/` | Broker interface, approval gate, persistent paper state. |
 | `experiments/` | Append-only trial registry (feeds multiple-testing corrections). |
 | `research/` | Run orchestration, process executor, PIT cache, DuckDB ownership, holdout. |
+| `api/routes/` | HTTP transport, validation, typed responses, and stable error envelopes. |
+| `api/services/` | Job lifecycle and adapters over research, report, metadata, and paper domains. |
+| `frontend/` | React presentation; consumes only `/api/*` and owns no quantitative rules. |
 
 ## Storage ownership
 
@@ -71,6 +80,9 @@ of fake alpha:
 
 Workers do not receive or import `ResultsStore`; the owning parent writes complete logical
 stages through Arrow-backed transactions. Failed runs remain queryable with stage and cause.
+The HTTP process adds one durable FIFO worker and a shared writer lock, so browser-submitted
+runs and locked-holdout mutations cannot create a second concurrent DuckDB writer. Paper JSON
+load/mutate/save cycles use a separate process-local lock and atomic file replacement.
 
 ## Point-in-time handling
 

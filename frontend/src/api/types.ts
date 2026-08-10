@@ -1,0 +1,32 @@
+import type { components } from "./generated/schema";
+
+export type Schema = components["schemas"];
+export type Metadata = Schema["MetadataResponse"];
+export type Snapshot = Schema["SnapshotSummary"];
+export type Run = Schema["RunDetail"];
+export type RunsPage = Schema["Page_RunDetail_"];
+export type RunSummary = Schema["RunSummaryResponse"];
+export type ModelMetric = Schema["ModelMetricRecord"];
+export type StrategyMetric = Schema["StrategyMetricRecord"];
+export type EquityPoint = Schema["EquityRecord"];
+export type Trade = Schema["TradeRecord"];
+export type Prediction = Schema["PredictionRecord"];
+export type Weight = Schema["WeightRecord"];
+export type OptimizerDiagnostic = Schema["OptimizerDiagnosticRecord"];
+export type OverfittingMetric = Schema["OverfittingRecord"];
+export type Report = Schema["ReportRecord"];
+export type PaperSummary = Schema["PaperSummary"];
+export type Proposal = Schema["ProposalRecord"];
+export type Position = Schema["PositionRecord"];
+export type ProductionModel = Schema["ProductionModel"];
+export type PaperHistory = Schema["HistoryResponse"];
+export type CreateRunInput = Schema["CreateRunRequest"];
+export type CreateRunResult = Schema["CreateRunResponse"];
+
+export type ModelMetricsPage = Schema["Page_ModelMetricRecord_"];
+export type StrategyMetricsPage = Schema["Page_StrategyMetricRecord_"];
+export type EquityPage = Schema["Page_EquityRecord_"];
+export type TradesPage = Schema["Page_TradeRecord_"];
+export type PredictionsPage = Schema["Page_PredictionRecord_"];
+export type WeightsPage = Schema["Page_WeightRecord_"];
+export type DiagnosticsPage = Schema["Page_OptimizerDiagnosticRecord_"];

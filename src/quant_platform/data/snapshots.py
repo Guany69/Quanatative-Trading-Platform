@@ -217,6 +217,17 @@ class SnapshotStore:
                 return self.load(str(manifest["snapshot_id"]))
         return None
 
+    def list(self) -> list[DataSnapshot]:
+        """Discover server-owned snapshots without accepting filesystem paths."""
+        snapshots: list[DataSnapshot] = []
+        for manifest_path in sorted(self.root.glob("*/manifest.json"), reverse=True):
+            snapshot_id = manifest_path.parent.name
+            try:
+                snapshots.append(self.load(snapshot_id, verify=False))
+            except SnapshotError:
+                continue
+        return snapshots
+
     @staticmethod
     def _canonicalize(name: str, frame: pl.DataFrame) -> pl.DataFrame:
         out = frame

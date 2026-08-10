@@ -6,7 +6,9 @@ import json
 import os
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -108,9 +110,27 @@ class ExperimentRunOrchestrator:
         self.report_root = Path(report_root)
         self.registry = ExperimentRegistry(registry_path)
 
-    def run(self, request: ResearchRunRequest) -> ResearchRunResult:
+    def run(
+        self,
+        request: ResearchRunRequest,
+        *,
+        run_id: str | None = None,
+        created_at: datetime | None = None,
+        progress: Callable[[str], None] | None = None,
+        recover_stale: bool = True,
+    ) -> ResearchRunResult:
+        """Execute one governed run.
+
+        The API job manager supplies the identity up front, performs stale recovery once at
+        application startup, and receives only real stage transitions through ``progress``.
+        CLI callers keep the historical startup-recovery behavior by default.
+        """
         started = time.perf_counter()
         timings: dict[str, float] = {}
+        run_id = run_id or uuid.uuid4().hex[:16]
+        stage = "INITIALIZATION"
+        if progress:
+            progress(stage)
         charter = load_charter(request.charter_path)
         self._validate_request(request, charter)
         set_global_seeds(charter.random_seed)
@@ -120,11 +140,10 @@ class ExperimentRunOrchestrator:
         timings["snapshot_seconds"] = time.perf_counter() - snapshot_started
         folds, calendar = derive_fold_schedule(snapshot, charter)
         schedule_hash = fold_schedule_hash(folds)
-        run_id = uuid.uuid4().hex[:16]
-        stage = "initialization"
 
         with ResultsStore(self.results_db) as store:
-            store.recover_stale_runs()
+            if recover_stale:
+                store.recover_stale_runs()
             store.create_run(
                 run_id=run_id,
                 snapshot_id=snapshot.snapshot_id,
@@ -136,9 +155,18 @@ class ExperimentRunOrchestrator:
                 strategies=list(request.strategies),
                 scenarios=list(request.scenarios),
                 fold_schedule_hash=schedule_hash,
+                created_at=created_at,
             )
+
+            def set_stage(value: str) -> None:
+                nonlocal stage
+                stage = value
+                store.update_stage(run_id, value)
+                if progress:
+                    progress(value)
+
             try:
-                stage = "pit_cache"
+                set_stage("PIT_CACHE")
                 cache_started = time.perf_counter()
                 cached = self.cache.get_or_build(
                     make_pit_cache_key(snapshot, charter, schedule_hash),
@@ -148,7 +176,7 @@ class ExperimentRunOrchestrator:
                 data = pipeline_data_from_cache(cached, charter, calendar)
                 store.write_folds(run_id, _fold_frame(folds, charter))
 
-                stage = "model_training"
+                set_stage("MODEL_TRAINING")
                 training_started = time.perf_counter()
                 task_results = self._train_models(run_id, request, charter, cached)
                 timings["model_training_seconds"] = time.perf_counter() - training_started
@@ -157,14 +185,14 @@ class ExperimentRunOrchestrator:
                 ]
                 self._persist_model_stage(store, comparison_results, task_results, cached, data)
 
-                stage = "portfolio_simulation"
+                set_stage("PORTFOLIO_SIMULATION")
                 simulation_started = time.perf_counter()
                 failed_variants, curves, strategy_metrics = self._run_portfolios(
                     store, run_id, request, charter, cached, data, comparison_results
                 )
                 timings["portfolio_simulation_seconds"] = time.perf_counter() - simulation_started
 
-                stage = "overfitting_stress"
+                set_stage("OVERFITTING_STRESS")
                 self._persist_overfitting(
                     store,
                     run_id,
@@ -187,7 +215,7 @@ class ExperimentRunOrchestrator:
                 )
                 self.registry.record(trial)
 
-                stage = "reporting"
+                set_stage("REPORTING")
                 report_dir = self.report_root / run_id
                 snapshot_config(charter, report_dir / "resolved_config.json")
                 report_paths = generate_persisted_run_report(store, run_id, report_dir)

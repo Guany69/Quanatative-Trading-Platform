@@ -7,8 +7,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-import matplotlib.pyplot as plt
+import matplotlib
 import polars as pl
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from quant_platform.research.results import ResultsStore
 

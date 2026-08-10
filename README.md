@@ -65,6 +65,26 @@ constructors on the same inputs, persists the complete run to `research.duckdb`,
 append-only experiment registry, and generates run-scoped reports. `run-demo` remains as a
 smaller legacy presentation workflow; it is not the research system of record.
 
+## Local web workstation
+
+The browser application is a typed adapter over the same research orchestrator, results
+store, and paper coordinator used by the CLI. It binds to loopback by default.
+
+```bash
+# terminal 1: API at http://127.0.0.1:8000 (interactive docs at /api/docs)
+uv run quant-platform-api
+
+# terminal 2: Vite development server at http://127.0.0.1:5173
+cd frontend
+npm ci
+npm run dev
+```
+
+For a single-origin local build, run `npm run build` in `frontend/`, return to the repository
+root, and start `uv run quant-platform-api`. FastAPI then serves both `frontend/dist` and
+`/api/*` at `http://127.0.0.1:8000`. See [docs/http_api.md](docs/http_api.md) for queue,
+storage, mutation, and route semantics.
+
 ## Commands
 
 ```bash
@@ -139,6 +159,13 @@ uv run pytest                          # everything
 uv run pytest tests/data_leakage/      # the bias controls
 uv run pytest tests/portfolio_accounting/
 uv run pytest -m "not slow"
+
+cd frontend
+npm run typecheck
+npm run lint
+npm test
+npm run build
+npm run test:e2e
 ```
 
 ## Benchmarking
@@ -172,7 +199,8 @@ Or `make check`.
 - [paper_trading.md](docs/paper_trading.md) — the approval gate and reconciliation
 - [limitations.md](docs/limitations.md) — **read before interpreting any output**
 - [reproducibility.md](docs/reproducibility.md) — seeding and known nondeterminism
-- [adr/](docs/adr/) — 13 architecture decision records
+- [http_api.md](docs/http_api.md) — browser API, queue semantics, routes, and local operation
+- [adr/](docs/adr/) — architecture decision records
 
 ## Troubleshooting
 
