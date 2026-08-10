@@ -177,12 +177,38 @@ def _caveats(card: Scorecard) -> str:
 </div>"""
 
 
+def _live_meta(card: Scorecard) -> str:
+    """Card subtitle: live quote when available, last close otherwise."""
+    if card.live_price is not None and card.quote_time is not None:
+        change = ""
+        if card.live_change_pct is not None and card.live_change_pct == card.live_change_pct:
+            arrow = "&#9650;" if card.live_change_pct >= 0 else "&#9660;"
+            colour = "#1a7f37" if card.live_change_pct >= 0 else "#b42318"
+            change = (
+                f' <span style="color:{colour};font-weight:600">{arrow} '
+                f"{card.live_change_pct:+.2%} today</span>"
+            )
+        session = (
+            "factors include today&rsquo;s partial session"
+            if card.includes_live_session
+            else "market closed &middot; latest completed session"
+        )
+        return (
+            f'<div class="meta"><strong>LIVE ${card.live_price:,.2f}</strong>{change} '
+            f"&middot; quote {card.quote_time:%H:%M} (may be ~15 min delayed) "
+            f"&middot; {session} &middot; ranked against {card.peer_count} peers</div>"
+        )
+    return (
+        f'<div class="meta">${card.price:,.2f} &middot; as of {card.as_of} &middot; '
+        f"ranked against {card.peer_count} peers</div>"
+    )
+
+
 def _render_card(card: Scorecard) -> str:
     parts = [
         '<div class="card">',
         f"<h2>{html.escape(card.ticker)}</h2>",
-        f'<div class="meta">${card.price:,.2f} &middot; as of {card.as_of} &middot; '
-        f"ranked against {card.peer_count} peers</div>",
+        _live_meta(card),
     ]
 
     if card.composite_percentile == card.composite_percentile:  # not NaN

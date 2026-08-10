@@ -32,7 +32,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -515,6 +515,10 @@ class Scorecard:
     as_of: date
     price: float
     peer_count: int
+    live_price: float | None = None
+    live_change_pct: float | None = None
+    quote_time: datetime | None = None
+    includes_live_session: bool = False
     factors: dict[str, list[FactorScore]] = field(default_factory=dict)
     family_percentiles: dict[str, float] = field(default_factory=dict)
     composite_percentile: float = float("nan")
@@ -669,6 +673,135 @@ def fetch_universe_prices_cached(
         logger.warning("could not write price cache: %s", exc)
 
     return prices, benchmark, missing
+
+
+# --------------------------------------------------------------------------- live quotes
+@dataclass(frozen=True)
+class LiveQuote:
+    """Today's in-progress session for one ticker."""
+
+    ticker: str
+    price: float
+    prev_close: float
+    session_date: date
+    fetched_at: datetime
+
+    @property
+    def change_pct(self) -> float:
+        if self.prev_close <= 0:
+            return float("nan")
+        return self.price / self.prev_close - 1.0
+
+
+def fetch_live_bars(tickers: list[str]) -> tuple[dict[str, LiveQuote], datetime]:
+    """Fetch today's in-progress bar for each ticker, in one batched request.
+
+    Yahoo's 2-day daily window returns yesterday's completed bar plus today's partial one
+    whenever the session is open; the partial bar's close is the latest traded price (it
+    matches ``fast_info.last_price``). Quotes may be delayed up to ~15 minutes depending on
+    the exchange -- treat them as recent, not tick-accurate.
+
+    Never cached: the entire point is freshness. When the market is closed the "latest" bar
+    is simply the last completed session and callers detect that via ``session_date``.
+    """
+    import yfinance as yf
+
+    fetched_at = datetime.now()
+    quotes: dict[str, LiveQuote] = {}
+    try:
+        raw = yf.download(
+            tickers=" ".join(tickers),
+            period="2d",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            group_by="ticker",
+        )
+    except Exception as exc:
+        logger.warning("live quote fetch failed: %s", exc)
+        return quotes, fetched_at
+
+    if raw is None or len(raw) == 0:
+        return quotes, fetched_at
+
+    for ticker in tickers:
+        try:
+            sub = raw[ticker] if len(tickers) > 1 else raw
+        except (KeyError, TypeError):
+            continue
+        sub = sub.dropna(subset=["Close"]) if "Close" in sub.columns else sub.dropna(how="all")
+        if len(sub) == 0:
+            continue
+        last = sub.iloc[-1]
+        prev_close = float(sub.iloc[-2]["Close"]) if len(sub) >= 2 else float(last["Close"])
+        quotes[ticker] = LiveQuote(
+            ticker=ticker,
+            price=float(last["Close"]),
+            prev_close=prev_close,
+            session_date=sub.index[-1].date(),
+            fetched_at=fetched_at,
+        )
+    return quotes, fetched_at
+
+
+def append_provisional_bars(
+    prices: pl.DataFrame, quotes: dict[str, LiveQuote]
+) -> tuple[pl.DataFrame, bool]:
+    """Overlay today's live prices onto the historical panel as provisional bars.
+
+    The price goes in; the volume deliberately does NOT. A partial session's volume (a few
+    hours of trading) would drag down every volume-derived feature -- ADV, Amihud, turnover --
+    because those assume complete sessions. So the provisional bar carries a null volume and
+    the liquidity features simply skip it, while momentum, volatility, and beta gain today's
+    move.
+
+    Bars whose date already exists in the panel are skipped (market closed: the "live" bar is
+    just yesterday's close, which history already has). Returns the panel plus whether any
+    live bar was actually appended.
+    """
+    if not quotes:
+        return prices, False
+
+    existing_latest = dict(
+        prices.group_by("security_id").agg(pl.col("observation_date").max().alias("d")).iter_rows()
+    )
+
+    rows = []
+    for ticker, quote in quotes.items():
+        latest = existing_latest.get(ticker)
+        if latest is not None and quote.session_date <= latest:
+            continue  # nothing newer than history: market closed or already covered
+        rows.append(
+            {
+                "security_id": ticker,
+                "observation_date": quote.session_date,
+                "close": quote.price,
+                # Today's raw price IS today's adjusted price: adjustments restate history
+                # backward from the present, and no future action is known yet.
+                "adjusted_close": quote.price,
+                "volume": None,
+                "dollar_volume": None,
+                "available_at": quote.fetched_at,
+                "source": "yfinance_live",
+            }
+        )
+    if not rows:
+        return prices, False
+
+    provisional = pl.DataFrame(
+        rows,
+        schema_overrides={
+            "volume": pl.Float64,
+            "dollar_volume": pl.Float64,
+            "observation_date": pl.Date,
+            "available_at": pl.Datetime,
+        },
+    )
+    merged = pl.concat([prices, provisional], how="diagonal").sort(
+        ["security_id", "observation_date"]
+    )
+    logger.info("appended %d provisional live bars for %s", len(rows), rows[0]["observation_date"])
+    return merged, True
 
 
 def build_peer_features(prices: pl.DataFrame, benchmark: pl.DataFrame) -> pl.DataFrame:
@@ -940,7 +1073,12 @@ def _composite_across_cross_section(cross_section: pl.DataFrame) -> dict[str, fl
             family_matrix.append(ranks)
         if family_matrix:
             stacked = np.vstack(family_matrix)
-            with np.errstate(invalid="ignore"):
+            import warnings as _warnings
+
+            with np.errstate(invalid="ignore"), _warnings.catch_warnings():
+                # A security with no computable factor in this family yields an all-NaN
+                # column; nanmean correctly returns NaN for it, and the warning is noise.
+                _warnings.filterwarnings("ignore", message="Mean of empty slice")
                 family_mean = np.nanmean(stacked, axis=0)
             scores.setdefault("_families", [])
             for i, sec in enumerate(ids):
@@ -962,6 +1100,7 @@ def analyze_tickers(
     end: date | None = None,
     use_cache: bool = True,
     include_fundamentals: bool = True,
+    live: bool = True,
 ) -> tuple[list[Scorecard], list[str]]:
     """Fetch data and build scorecards for one or more tickers.
 
@@ -975,6 +1114,19 @@ def analyze_tickers(
     prices, benchmark, missing = fetch_universe_prices_cached(
         universe, lookback_days, end, use_cache=use_cache
     )
+
+    quotes: dict[str, LiveQuote] = {}
+    live_appended = False
+    if live and end is None:  # a historical as-of request must not receive today's quotes
+        logger.info("fetching live quotes (never cached)")
+        quotes, _fetched = fetch_live_bars([*universe, BENCHMARK_TICKER])
+        prices, live_appended = append_provisional_bars(prices, quotes)
+        if BENCHMARK_TICKER in quotes:
+            bench_prices = benchmark.drop("benchmark_return", strict=False)
+            bench_prices, _ = append_provisional_bars(
+                bench_prices, {BENCHMARK_TICKER: quotes[BENCHMARK_TICKER]}
+            )
+            benchmark = _with_benchmark_return(bench_prices)
 
     logger.info("computing features for %d securities", prices["security_id"].n_unique())
     features = build_peer_features(prices, benchmark)
@@ -999,7 +1151,14 @@ def analyze_tickers(
 
     for ticker in [t for t in tickers if t not in missing]:
         try:
-            cards.append(build_scorecard(ticker, features, prices, unavailable_pillars=unavailable))
+            card = build_scorecard(ticker, features, prices, unavailable_pillars=unavailable)
+            quote = quotes.get(ticker)
+            if quote is not None:
+                card.live_price = quote.price
+                card.live_change_pct = quote.change_pct
+                card.quote_time = quote.fetched_at
+                card.includes_live_session = live_appended and quote.session_date == card.as_of
+            cards.append(card)
         except ValueError as exc:
             logger.warning("could not score %s: %s", ticker, exc)
             failures.append(f"{ticker}: {exc}")
@@ -1022,7 +1181,22 @@ def format_scorecard(card: Scorecard, explain: bool = False) -> str:
     lines: list[str] = []
     lines.append("=" * 74)
     lines.append(f"  {card.ticker}  --  factor scorecard as of {card.as_of}")
-    lines.append(f"  last close ${card.price:,.2f}   |   ranked against {card.peer_count} peers")
+    if card.live_price is not None and card.quote_time is not None:
+        change = f"{card.live_change_pct:+.2%} today" if card.live_change_pct is not None else ""
+        session = (
+            "factors include today's partial session"
+            if card.includes_live_session
+            else "market closed; latest completed session"
+        )
+        lines.append(
+            f"  LIVE ${card.live_price:,.2f}  {change}  "
+            f"(quote {card.quote_time:%H:%M}, may be ~15 min delayed)"
+        )
+        lines.append(f"  {session}   |   ranked against {card.peer_count} peers")
+    else:
+        lines.append(
+            f"  last close ${card.price:,.2f}   |   ranked against {card.peer_count} peers"
+        )
     lines.append("=" * 74)
 
     if np.isfinite(card.composite_percentile):
