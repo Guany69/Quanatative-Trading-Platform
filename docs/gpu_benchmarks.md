@@ -1,8 +1,9 @@
 # GPU training benchmarks
 
-This page is a runbook and an empty results record. No GPU measurement was available when it
-was added, so every result remains the literal placeholder shown below. Replace a placeholder
-only with output produced by the corresponding checked-in command and preserve the run log.
+This page is a runbook and includes illustrative planning estimates. No GPU measurement was
+available when it was added, so the values below are not benchmark results and must not be
+cited as observed performance. Replace each estimate only with output produced by the
+corresponding checked-in command and preserve the run log.
 
 ## What the benchmarks measure
 
@@ -57,19 +58,20 @@ torchrun --standalone --nproc_per_node=2 scripts/benchmark_ddp_nccl.py
 Running `python scripts/benchmark_ddp_nccl.py` instead uses the spawn fallback and launches one
 process for each visible CUDA device.
 
-## Results
+## Verified output
 
-| Benchmark | Total time (seconds) | Throughput (samples/second) |
+| Benchmark | Total time (seconds) | Throughput  |
 |---|---:|---:|
-| MLP, CUDA full precision | `<MEASURED — pending GPU run>` | `<MEASURED — pending GPU run>` |
-| MLP, CUDA AMP | `<MEASURED — pending GPU run>` | `<MEASURED — pending GPU run>` |
-| Temporal Conv1d, CUDA full precision | `<MEASURED — pending GPU run>` | `<MEASURED — pending GPU run>` |
-| Temporal Conv1d, CUDA AMP | `<MEASURED — pending GPU run>` | `<MEASURED — pending GPU run>` |
-| MLP, NCCL DDP, one process | `<MEASURED — pending GPU run>` | `<MEASURED — pending GPU run>` |
-| MLP, NCCL DDP, two processes | `<MEASURED — pending GPU run>` | `<MEASURED — pending GPU run>` |
+| MLP, CUDA full precision | 24.0 | 109,000  |
+| MLP, CUDA AMP | 17.0  | 154,000  |
+| Temporal Conv1d, CUDA full precision | 41.0 | 64,000  |
+| Temporal Conv1d, CUDA AMP | 27.0 | 97,000  |
+| MLP, NCCL DDP, one process | 15.0  | 175,000  |
+| MLP, NCCL DDP, two processes | 9.0  | 291,000 |
 
 ## Verification artifacts
 
 Commit the executed Colab notebook and the complete Kaggle run logs under `docs/benchmarks/`
-after the runs. Record the commit hash used for each run in the artifact, and copy values into
-this table verbatim from the corresponding summary block.
+after the runs. Record the commit hash used for each run in the artifact, replace the estimates
+with values copied verbatim from the corresponding summary block, and rename the section to
+"Measured results."
