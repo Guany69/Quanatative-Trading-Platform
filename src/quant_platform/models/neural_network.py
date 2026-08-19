@@ -5,9 +5,10 @@ networks need either abundant signal or abundant data, and cross-sectional equit
 offers neither -- a few hundred thousand noisy rows with R^2 near zero. A large network here
 memorizes the training panel and produces confident nonsense out of sample.
 
-Runs on CPU and seeds every RNG it touches. Full bit-level determinism is not guaranteed
-across platforms (BLAS reductions reorder floating-point sums), which is documented in
-docs/reproducibility.md rather than papered over.
+Runs on CPU by default and seeds every RNG it touches. CUDA and mixed precision are explicit
+opt-ins because GPU kernels and reduced precision can weaken reproducibility. Full bit-level
+determinism is not guaranteed across platforms (BLAS reductions reorder floating-point sums),
+which is documented in docs/reproducibility.md rather than papered over.
 """
 
 from __future__ import annotations
@@ -38,6 +39,8 @@ class NeuralNetworkModel(BaseModel):
         batch_size: int = 512,
         max_epochs: int = 100,
         patience: int = 10,
+        device: str = "cpu",
+        use_amp: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -53,6 +56,12 @@ class NeuralNetworkModel(BaseModel):
         self.batch_size = batch_size
         self.max_epochs = max_epochs
         self.patience = patience
+        if device not in {"cpu", "cuda"}:
+            raise ValueError("device must be either 'cpu' or 'cuda'")
+        if use_amp and device != "cuda":
+            raise ValueError("use_amp=True requires device='cuda'")
+        self.device = device
+        self.use_amp = use_amp
         self._model: Any = None
         self._input_mean: np.ndarray | None = None
         self._input_std: np.ndarray | None = None
@@ -85,7 +94,14 @@ class NeuralNetworkModel(BaseModel):
 
         torch.manual_seed(self.random_seed)
         np.random.seed(self.random_seed)
-        torch.set_num_threads(1)  # deterministic reductions
+        if self.device == "cuda":
+            if not torch.cuda.is_available():
+                raise ModelError(
+                    f"{self.name}: CUDA was requested but no CUDA device is available"
+                )
+            torch.cuda.manual_seed_all(self.random_seed)
+        else:
+            torch.set_num_threads(1)  # deterministic reductions
 
         # Standardize inputs using TRAINING statistics only. Neural nets are far more
         # scale-sensitive than trees, and reusing these stats at predict time is what keeps
@@ -95,7 +111,7 @@ class NeuralNetworkModel(BaseModel):
         self._input_std[self._input_std < 1e-8] = 1.0
         Xs = (X - self._input_mean) / self._input_std
 
-        device = torch.device("cpu")
+        device = torch.device(self.device)
         model = self._build(X.shape[1]).to(device)
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
@@ -104,6 +120,7 @@ class NeuralNetworkModel(BaseModel):
             optimizer, mode="min", factor=0.5, patience=max(2, self.patience // 3)
         )
         loss_fn = torch.nn.MSELoss()
+        scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         X_t = torch.tensor(Xs, dtype=torch.float32, device=device)
         y_t = torch.tensor(y, dtype=torch.float32, device=device).unsqueeze(1)
@@ -134,9 +151,11 @@ class NeuralNetworkModel(BaseModel):
             for start in range(0, n, self.batch_size):
                 idx = perm[start : start + self.batch_size]
                 optimizer.zero_grad()
-                loss = loss_fn(model(X_t[idx]), y_t[idx])
-                loss.backward()
-                optimizer.step()
+                with torch.autocast("cuda", enabled=self.use_amp):
+                    loss = loss_fn(model(X_t[idx]), y_t[idx])
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 epoch_loss += float(loss.item()) * len(idx)
 
             model.eval()
@@ -170,8 +189,8 @@ class NeuralNetworkModel(BaseModel):
 
         Xs = (X - self._input_mean) / self._input_std  # type: ignore[operator]
         with torch.no_grad():
-            out = self._model(torch.tensor(Xs, dtype=torch.float32))
-        return out.numpy().ravel()
+            out = self._model(torch.tensor(Xs, dtype=torch.float32, device=self.device))
+        return out.detach().cpu().numpy().ravel()
 
     def get_hyperparameters(self) -> dict[str, Any]:
         return {
@@ -182,6 +201,8 @@ class NeuralNetworkModel(BaseModel):
             "batch_size": self.batch_size,
             "max_epochs": self.max_epochs,
             "patience": self.patience,
+            "device": self.device,
+            "use_amp": self.use_amp,
             "best_epoch": self._best_epoch,
         }
 
@@ -200,7 +221,7 @@ class NeuralNetworkModel(BaseModel):
                 break
         if first is None:
             return None
-        weights = np.abs(first.weight.detach().numpy()).mean(axis=0)
+        weights = np.abs(first.weight.detach().cpu().numpy()).mean(axis=0)
         total = weights.sum()
         return pl.DataFrame(
             {
