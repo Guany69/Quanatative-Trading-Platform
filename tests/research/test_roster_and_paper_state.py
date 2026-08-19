@@ -19,6 +19,7 @@ EXPECTED_MODELS = {
     "lightgbm",
     "random_forest",
     "neural_network",
+    "temporal_conv",
     "ensemble",
 }
 
@@ -29,6 +30,7 @@ def test_complete_model_and_strategy_rosters_are_registered():
     assert create_model("lightgbm").__class__.__module__.endswith("trees")
     assert create_model("elastic_net").__class__.__module__.endswith("linear")
     assert create_model("random_forest").__class__.__module__.endswith("trees")
+    assert create_model("temporal_conv").__class__.__module__.endswith("temporal_conv")
     assert set(TARGET_STRATEGIES) == {
         "equal_weight",
         "score_weighted",

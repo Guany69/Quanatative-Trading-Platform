@@ -15,7 +15,7 @@ Action is `REUSE`, `MODIFY`, `REPLACE`, `ADD`, or `REMOVE`.
 | HLD-003 | 1.2, 5.1 | Modular monolith staged pipeline with batch research and forward paper orchestration planes over shared storage. | Existing modular packages + `paper/*`; add `research/*`. | PARTIAL / ADD | IMPLEMENTED | Dependency-direction review and end-to-end tests. |
 | HLD-004 | 1.3, 14.3 | No services, brokers, distributed compute, external cache, GPU requirement, hosted API, or multi-user serving. | Whole repository. | SATISFIED / REUSE | VERIFIED EXISTING | Architecture/import audit; Nautilus seam remains non-functional. |
 | HLD-005 | 1.4 | Consume OHLCV, benchmark, corporate actions/delistings, security metadata, PIT membership, optional fundamentals/macro/factors, charter, approvals. | `data/*`, `config/*`, `execution/*`; snapshot admission path. | PARTIAL / MODIFY | IMPLEMENTED | Snapshot manifest and integration tests. |
-| HLD-006 | 1.4 | Produce all-nine model comparison with predictions and fold metrics. | Registry exists; add executor, orchestrator, DB. | PARTIAL / ADD | IMPLEMENTED | Roster/executor/results tests and research-run smoke. |
+| HLD-006 | 1.4 | Produce the full model comparison with predictions and fold metrics. | Registry exists; add executor, orchestrator, DB. | PARTIAL / ADD | IMPLEMENTED | Roster/executor/results tests and research-run smoke. |
 | HLD-007 | 1.4 | Produce all-four strategy comparison, gross/net, scenarios, curves, trades, relaxations. | Three constructors wired today; optimizer exists but is not registered in common path. | CONFLICTING / MODIFY | IMPLEMENTED | Four-strategy fan-out and persistence tests. |
 | HLD-008 | 1.4 | Produce DSR, PBO, placebo, cost and regime stress using trial history. | Statistics exist but have no governed caller. | PARTIAL / MODIFY | IMPLEMENTED | Automatic evaluation/results tests. |
 | HLD-009 | 1.4, 11.3 | HTML, Markdown, CSV, JSON and charts are run-scoped regenerable reports, not authority. | `evaluation/report.py`; reports currently consume in-memory/demo results. | PARTIAL / MODIFY | IMPLEMENTED | Regenerate report from DuckDB test. |
@@ -57,7 +57,7 @@ Action is `REUSE`, `MODIFY`, `REPLACE`, `ADD`, or `REMOVE`.
 | HLD-045 | 5.2, 11 | Cache key includes snapshot, universe version, feature versions, label params/version, validation, purge, embargo, fold schedule hash. | Missing. | MISSING / ADD | IMPLEMENTED | One-change-at-a-time invalidation tests. |
 | HLD-046 | 5.2, 11 | Cache is sole-writer, safe/disposable; deleting changes runtime only, never outputs; unsafe panels cannot enter. | Missing. | MISSING / ADD | IMPLEMENTED | Safety marker, deletion equivalence tests. |
 | HLD-047 | 5.2, bias 5 | Preprocessor fits TRAIN ONLY inside isolated task; validation/test only transform; no fitted state shared. | Serial helper fits train only. | PARTIAL / MODIFY | IMPLEMENTED | Existing leakage tests + task isolation test. |
-| HLD-048 | 7 | Exactly nine registry names and common fit/predict/schema/provenance contract. | Exact registry exists. | SATISFIED / REUSE | VERIFIED EXISTING | Registry roster/common-contract tests. |
+| HLD-048 | 7 | All registry names share the fit/predict/schema/provenance contract. | Exact registry exists. | SATISFIED / REUSE | VERIFIED EXISTING | Registry roster/common-contract tests. |
 | HLD-049 | 7 | `no_skill` baseline/control runs through governed comparison. | Implemented/registered. | SATISFIED / REUSE | VERIFIED EXISTING | Roster and executor tests. |
 | HLD-050 | 7 | `momentum_baseline` rule model runs through governed comparison. | Implemented/registered. | SATISFIED / REUSE | VERIFIED EXISTING | Roster and executor tests. |
 | HLD-051 | 7 | `factor_composite` multi-factor rule model runs through governed comparison. | Implemented/registered. | SATISFIED / REUSE | VERIFIED EXISTING | Roster and executor tests. |
@@ -120,7 +120,7 @@ Action is `REUSE`, `MODIFY`, `REPLACE`, `ADD`, or `REMOVE`.
 ## Baseline evidence before edits
 
 - Existing full suite: passed on 2026-08-10.
-- Registered model names: all nine HLD names exist.
+- Registered model names: all HLD names plus the experimental temporal convolution model exist.
 - Governed research-plane search: no `research` package, ResultsStore, DuckDB schema,
   process-pool executor, `research-run`, `results`, or benchmark harness exists.
 - Current `walk-forward`: one model, serial folds, CSV output, skips empty folds.
@@ -140,7 +140,7 @@ Action is `REUSE`, `MODIFY`, `REPLACE`, `ADD`, or `REMOVE`.
   policy mismatch; forward scoring is label-free; PBO consumes persisted experiment-history
   curves; legacy data commands consume the PIT cache by default; legacy training writes only
   run-scoped artifacts; artifact metadata carries all fold windows.
-- Final local fixture benchmark (`80` securities, all nine models, six folds, all four
+- Final local fixture benchmark (`80` securities, all ten models, six folds, all four
   strategies, base costs, two workers): cold run `cf371530de2a49cd` completed in `154.291s`
   with a `2.559s` panel build; warm run `d0f6d9e9895e43a4` completed in `131.920s` with a
   `0.048s` cache load. Peak process RSS was `1,057,439,744` bytes on macOS. This is not the

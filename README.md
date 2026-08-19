@@ -60,7 +60,7 @@ uv run quant-platform research-run --models all --strategies all --workers 2
 ```
 
 This creates or resolves an immutable data snapshot, validates and content-caches PIT fold
-panels, trains all nine models in model/fold worker processes, compares four portfolio
+panels, trains all ten models in model/fold worker processes, compares four portfolio
 constructors on the same inputs, persists the complete run to `research.duckdb`, links the
 append-only experiment registry, and generates run-scoped reports. `run-demo` remains as a
 smaller legacy presentation workflow; it is not the research system of record.

@@ -1,8 +1,8 @@
 """Model registry: name -> constructor (spec section 14).
 
 Keeps the CLI's `--model X` and the config files decoupled from import paths, and keeps the
-set of production-eligible models explicit. `RandomForestModel` is registered but flagged
-non-production, so `production_candidates()` will not return it.
+set of production-eligible models explicit. Diagnostic and experimental models are registered
+but flagged non-production, so `production_candidates()` will not return them.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from quant_platform.models.baselines import (
 from quant_platform.models.ensemble import RankEnsemble
 from quant_platform.models.linear import ElasticNetModel, LogisticModel
 from quant_platform.models.neural_network import NeuralNetworkModel
+from quant_platform.models.temporal_conv import TemporalConvModel
 from quant_platform.models.trees import LightGBMModel, RandomForestModel
 
 MODEL_REGISTRY: dict[str, type[BaseModel]] = {
@@ -29,6 +30,7 @@ MODEL_REGISTRY: dict[str, type[BaseModel]] = {
     "lightgbm": LightGBMModel,
     "random_forest": RandomForestModel,
     "neural_network": NeuralNetworkModel,
+    "temporal_conv": TemporalConvModel,
     "ensemble": RankEnsemble,
 }
 
@@ -48,8 +50,8 @@ def create_model(name: str, **kwargs: Any) -> BaseModel:
 def production_candidates() -> list[str]:
     """Models eligible to become the production signal.
 
-    Excludes anything flagged `is_production_candidate = False` (the random-forest
-    diagnostic), per spec section 14.5.
+    Excludes anything flagged `is_production_candidate = False`, including diagnostics and
+    experimental challengers, per spec section 14.5.
     """
     return sorted(
         name
